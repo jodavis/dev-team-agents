@@ -58,7 +58,7 @@ python -c "import sys; print(sys.platform)"
 ### 3 — Start the pipeline script in the background
 
 ```bash
-python -u .claude/scripts/dev_team.py <work-item-id> --workflow .claude/scripts/<pipeline>.md --research-skill <research-skill>
+python -u ${CLAUDE_PLUGIN_ROOT}/scripts/dev_team.py <work-item-id> --workflow ${CLAUDE_PLUGIN_ROOT}/scripts/<pipeline>.md --research-skill <research-skill> --plugin-root ${CLAUDE_PLUGIN_ROOT}
 ```
 
 ### 4 — Stream output

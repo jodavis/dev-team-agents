@@ -13,6 +13,7 @@ import argparse
 import concurrent.futures
 import datetime
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -781,21 +782,24 @@ class DevTeamPipeline:
 # ---------------------------------------------------------------------------
 
 def _find_repo_root() -> Path:
-    """Walk up from this file until a directory containing .claude/ is found."""
-    current = Path(__file__).resolve().parent
+    """Walk up from cwd until a directory containing .git or .claude/ is found."""
+    current = Path(os.getcwd()).resolve()
     while True:
-        if (current / ".claude").is_dir():
+        if (current / ".claude").is_dir() or (current / ".git").is_dir():
             return current
         parent = current.parent
         if parent == current:
             raise RuntimeError(
-                f"Could not locate repo root: no .claude/ directory found "
-                f"in any ancestor of {Path(__file__).resolve()}"
+                f"Could not locate repo root: no .claude/ or .git directory found "
+                f"in any ancestor of {Path(os.getcwd()).resolve()}"
             )
         current = parent
 
 
 REPO_ROOT = _find_repo_root()
+
+# Resolved after argument parsing; default to the directory containing this script.
+PLUGIN_ROOT: Path = Path(__file__).resolve().parent.parent
 
 
 def _resolve_claude() -> list[str]:
@@ -997,8 +1001,8 @@ def call_agent(
     definition for its instructions, and calls `claude -p` with the combined prompt.
 
     Args:
-        agent_name:     Name of the agent (matches .claude/agents/<name>.md).
-        skill_name:     Name of the skill (matches .claude/commands/<name>.md).
+        agent_name:     Name of the agent (matches ../agents/<name>.md).
+        skill_name:     Name of the skill (matches ../commands/<name>.md).
         *args:          Arguments passed to the skill, substituted for $ARGUMENTS.
         stream:         If True (default), print output to stdout as it arrives.
                         Set to False for agents that return structured JSON.
@@ -1014,16 +1018,16 @@ def call_agent(
         RuntimeError: claude CLI not on PATH, or unexpected output format.
         subprocess.CalledProcessError: claude CLI exited with non-zero status.
     """
-    agent_path = REPO_ROOT / ".claude" / "agents" / f"{agent_name}.md"
-    skill_path = REPO_ROOT / ".claude" / "commands" / f"{skill_name}.md"
+    agent_path = PLUGIN_ROOT / "agents" / f"{agent_name}.md"
+    skill_path = PLUGIN_ROOT / "commands" / f"{skill_name}.md"
 
     if not agent_path.exists():
         raise FileNotFoundError(
-            f"Agent definition not found: .claude/agents/{agent_name}.md"
+            f"Agent definition not found: {agent_path}"
         )
     if not skill_path.exists():
         raise FileNotFoundError(
-            f"Skill definition not found: .claude/commands/{skill_name}.md"
+            f"Skill definition not found: {skill_path}"
         )
 
     agent_meta, agent_body = _parse_frontmatter(agent_path.read_text(encoding="utf-8"))
@@ -1233,7 +1237,13 @@ def main() -> None:
                         help="Path to a Mermaid stateDiagram-v2 workflow file")
     parser.add_argument("--research-skill", required=True, metavar="skill",
                         help="Researcher skill to use (e.g. researcher-plan or researcher-issue)")
+    parser.add_argument("--plugin-root", metavar="path", default=None,
+                        help="Plugin installation root (agents/ and commands/ resolved here)")
     args = parser.parse_args()
+
+    global PLUGIN_ROOT
+    if args.plugin_root:
+        PLUGIN_ROOT = Path(args.plugin_root).resolve()
 
     work_item_id = args.work_item_id
     workflow_path = Path(args.workflow)
