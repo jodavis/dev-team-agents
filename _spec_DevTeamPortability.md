@@ -317,13 +317,13 @@ The minimum code changes to make `dev_team.py` work as a Claude Code plugin, the
 
 ---
 
-> **Note:** CloudDevTeam tasks ADR-253 through ADR-256 (see `_spec_CloudDevTeam.md`) are implemented next, entirely in dev-team-agents. Do not update AdaptiveRemote's plugin until all four are complete.
+> **Note:** CloudDevTeam tasks 253 through 256 (see `_spec_CloudDevTeam.md`) are implemented next, entirely in dev-team-agents. Do not update AdaptiveRemote's plugin until all four are complete.
 
 ---
 
 ### 🤖 Task 4: Local pipeline validation with CloudDevTeam changes ([ADR-266](https://jodasoft.atlassian.net/browse/ADR-266))
 
-After CloudDevTeam (ADR-253–256) is fully implemented in dev-team-agents, pull those changes into the local plugin and validate the modified pipeline end-to-end locally before attempting cloud execution.
+After CloudDevTeam (253–256) is fully implemented in dev-team-agents, pull those changes into the local plugin and validate the modified pipeline end-to-end locally before attempting cloud execution.
 
 - [ ] `git pull` in the local plugin installation picks up all CloudDevTeam changes
 - [ ] A full researcher → developer → reviewer → sign-off cycle completes locally using an ADR-191 task

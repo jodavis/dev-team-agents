@@ -51,6 +51,21 @@ class WorkflowDefinition:
     initial_state: str
 
 
+@dataclass
+class ReviewComment:
+    author: str   # "Reviewer" or "Developer"
+    comment: str
+
+
+@dataclass
+class ReviewThread:
+    id: str           # 8-char UUID assigned by dev_team.py
+    file_path: str    # repo-relative path
+    line_number: int  # 1-based
+    resolved: bool    # set only by the Reviewer
+    comments: list[ReviewComment] = field(default_factory=list)
+
+
 def parse_workflow(path: Path) -> WorkflowDefinition:
     """Parse a Mermaid stateDiagram-v2 block from a markdown file.
 
@@ -143,7 +158,9 @@ class PipelineContext:
     work_summaries: list[str] = field(default_factory=list)
     fix_iteration: int = 0
     review_fix_iteration: int = 0
-    pr_url: str = ""
+    base_branch: str = ""
+    first_push_done: bool = False
+    review_threads: list[ReviewThread] = field(default_factory=list)
     review_notes: str = ""
     last_failure: str = ""
     build_log: str = ""
@@ -163,7 +180,8 @@ class PipelineContext:
             f"spec_path: {self.spec_path}",
             f"fix_iteration: {self.fix_iteration}",
             f"review_fix_iteration: {self.review_fix_iteration}",
-            f"pr_url: {self.pr_url}",
+            f"base_branch: {self.base_branch}",
+            f"first_push_done: {'true' if self.first_push_done else 'false'}",
             f"build_log: {self.build_log}",
             f"test_log: {self.test_log}",
             f"started: {self.started.isoformat()}",
@@ -184,8 +202,25 @@ class PipelineContext:
             for i, summary in enumerate(self.work_summaries[1:], start=1):
                 lines += ["", f"<!-- section:Fix {i} -->", "", summary.strip()]
 
-        if self.review_notes:
-            lines += ["", "<!-- section:Review Notes -->", "", self.review_notes.strip()]
+        lines += ["", "<!-- section:Review Notes -->", "", self.review_notes.strip()]
+
+        threads_json = json.dumps(
+            [
+                {
+                    "id": t.id,
+                    "filePath": t.file_path,
+                    "lineNumber": t.line_number,
+                    "resolved": t.resolved,
+                    "comments": [
+                        {"author": c.author, "comment": c.comment}
+                        for c in t.comments
+                    ],
+                }
+                for t in self.review_threads
+            ],
+            indent=2,
+        )
+        lines += ["", "<!-- section:Review Threads -->", "", threads_json]
 
         if self.last_failure:
             lines += ["", "<!-- section:Last Failure -->", "", self.last_failure.strip()]
@@ -213,7 +248,8 @@ class PipelineContext:
             state=meta.get("state", "init"),
             fix_iteration=int(meta.get("fix_iteration", 0)),
             review_fix_iteration=int(meta.get("review_fix_iteration", 0)),
-            pr_url=meta.get("pr_url", ""),
+            base_branch=meta.get("base_branch", ""),
+            first_push_done=meta.get("first_push_done", "false") == "true",
             build_log=meta.get("build_log", ""),
             test_log=meta.get("test_log", ""),
         )
@@ -237,6 +273,27 @@ class PipelineContext:
             i += 1
         ctx.work_summaries = work_summaries
         ctx.review_notes = sections.get("Review Notes", "")
+
+        review_threads_json = sections.get("Review Threads", "").strip()
+        if review_threads_json:
+            try:
+                threads_data = json.loads(review_threads_json)
+                ctx.review_threads = [
+                    ReviewThread(
+                        id=t["id"],
+                        file_path=t["filePath"],
+                        line_number=t["lineNumber"],
+                        resolved=t["resolved"],
+                        comments=[
+                            ReviewComment(author=c["author"], comment=c["comment"])
+                            for c in t.get("comments", [])
+                        ],
+                    )
+                    for t in threads_data
+                ]
+            except (json.JSONDecodeError, KeyError, TypeError):
+                ctx.review_threads = []
+
         ctx.last_failure = sections.get("Last Failure", "")
 
         return ctx
@@ -315,6 +372,33 @@ def parse_json_output(text: str) -> dict:
             continue
 
     return {}
+
+
+def parse_json_list_output(text: str) -> list:
+    """Extract the last parseable JSON array from agent output text.
+
+    Tries fenced code blocks first (from the end), then bare JSON lines.
+    Returns an empty list if nothing parses.
+    """
+    for block in reversed(re.findall(r"```(?:json)?\s*\n([\s\S]*?)\n```", text)):
+        try:
+            result = json.loads(block.strip())
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError:
+            continue
+
+    for line in reversed(text.strip().splitlines()):
+        line = line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            try:
+                result = json.loads(line)
+                if isinstance(result, list):
+                    return result
+            except json.JSONDecodeError:
+                continue
+
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -1269,6 +1353,44 @@ def main() -> None:
         print(f"Resuming {work_item_id} from state '{ctx.state}'...", flush=True)
     else:
         ctx = PipelineContext(work_item_id=work_item_id, state=workflow.initial_state)
+        ctx.save(context_path)
+
+    if not ctx.base_branch:
+        try:
+            subprocess.run(
+                ["git", "fetch", "--all"], check=True, cwd=REPO_ROOT, capture_output=True,
+            )
+            r = subprocess.run(
+                ["git", "branch", "-r"],
+                check=True, cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8",
+            )
+            remote_branches = [b.strip() for b in r.stdout.splitlines() if b.strip()]
+            feature_branches = [
+                b.replace("origin/", "", 1)
+                for b in remote_branches
+                if b.startswith("origin/feature/")
+            ]
+            candidates = ["main"] + [b for b in feature_branches if b != "main"]
+
+            best_candidate = "main"
+            best_count: int | None = None
+            for candidate in candidates:
+                try:
+                    rc = subprocess.run(
+                        ["git", "rev-list", "--count", f"origin/{candidate}..HEAD"],
+                        check=True, cwd=REPO_ROOT, capture_output=True,
+                        text=True, encoding="utf-8",
+                    )
+                    count = int(rc.stdout.strip())
+                    if best_count is None or count < best_count:
+                        best_count = count
+                        best_candidate = candidate
+                except (subprocess.CalledProcessError, ValueError):
+                    continue
+
+            ctx.base_branch = best_candidate
+        except subprocess.CalledProcessError:
+            ctx.base_branch = "main"
         ctx.save(context_path)
 
     DevTeamPipeline(ctx, context_path, workflow, research_skill=args.research_skill).run()
