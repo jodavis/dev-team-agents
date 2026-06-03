@@ -291,7 +291,7 @@ class PipelineContext:
                     )
                     for t in threads_data
                 ]
-            except (json.JSONDecodeError, KeyError):
+            except (json.JSONDecodeError, KeyError, TypeError):
                 ctx.review_threads = []
 
         ctx.last_failure = sections.get("Last Failure", "")

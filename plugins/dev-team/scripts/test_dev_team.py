@@ -161,6 +161,18 @@ class TestPipelineContextReviewThreads:
         assert "file_path" not in after_sentinel
         assert "line_number" not in after_sentinel
 
+    def test_load_non_list_json_in_section_returns_empty(self, tmp_path):
+        # Valid JSON that is not a list (null, dict, string) must not crash load()
+        for idx, bad_value in enumerate(["null", '{"key": "value"}', '"just a string"']):
+            p = tmp_path / f"ctx_{idx}.md"
+            p.write_text(
+                "---\nwork_item_id: ADR-1\nstate: init\n---\n"
+                f"<!-- section:Review Threads -->\n{bad_value}\n",
+                encoding="utf-8",
+            )
+            loaded = PipelineContext.load(p)
+            assert loaded.review_threads == [], f"Expected [] for bad_value={bad_value!r}"
+
     def test_no_pr_url_field(self):
         ctx = PipelineContext(work_item_id="ADR-1")
         assert not hasattr(ctx, "pr_url")
