@@ -935,44 +935,48 @@ class _MdStreamWriter:
                     tool_input = json.loads(self._tool_json) if self._tool_json else {}
                 except json.JSONDecodeError:
                     tool_input = {"raw": self._tool_json}
-                ts = self._ts()
-                if self._tool_name == "Bash":
-                    self._file.write(
-                        f"\n**[{ts}]**\n"
-                        f"```bash\n"
-                        f"# {tool_input['description']}\n"
-                        f"{tool_input['command']}\n"
-                        f"```\n\n"
-                    )
-                elif self._tool_name == "Read":
-                    self._file.write(
-                        f"\n**[{ts}]**\n"
-                        f"```\n"
-                        f"Reading {tool_input['file_path']}\n"
-                        f"```\n\n"
-                    )
-                elif self._tool_name == "Glob":
-                    self._file.write(
-                        f"\n**[{ts}]**\n"
-                        f"```\n"
-                        f"Searching for {tool_input['pattern']}\n"
-                        f"```\n\n"
-                    )
-                elif self._tool_name == "Grep":
-                    self._file.write(
-                        f"\n**[{ts}]**\n"
-                        f"```\n"
-                        f"Searching for {tool_input['pattern']} in {tool_input.get('glob', '')}\n"
-                        f"```\n\n"
-                    )
-                else:
-                    self._file.write(
-                        f"\n**[{ts}]**\n"
-                        f"```json\n"
-                        f"{json.dumps({'tool': self._tool_name, 'input': tool_input}, indent=2, ensure_ascii=False)}\n"
-                        f"```\n\n"
-                    )
-                self._file.flush()
+                try:
+                    ts = self._ts()
+                    if self._tool_name == "Bash":
+                        self._file.write(
+                            f"\n**[{ts}]**\n"
+                            f"```bash\n"
+                            f"# {tool_input.get('description', '')}\n"
+                            f"{tool_input.get('command', '')}\n"
+                            f"```\n\n"
+                        )
+                    elif self._tool_name == "Read":
+                        self._file.write(
+                            f"\n**[{ts}]**\n"
+                            f"```\n"
+                            f"Reading {tool_input.get('file_path', '')}\n"
+                            f"```\n\n"
+                        )
+                    elif self._tool_name == "Glob":
+                        self._file.write(
+                            f"\n**[{ts}]**\n"
+                            f"```\n"
+                            f"Searching for {tool_input.get('pattern', '')}\n"
+                            f"```\n\n"
+                        )
+                    elif self._tool_name == "Grep":
+                        self._file.write(
+                            f"\n**[{ts}]**\n"
+                            f"```\n"
+                            f"Searching for {tool_input.get('pattern', '')} in {tool_input.get('glob', '')}\n"
+                            f"```\n\n"
+                        )
+                    else:
+                        self._file.write(
+                            f"\n**[{ts}]**\n"
+                            f"```json\n"
+                            f"{json.dumps({'tool': self._tool_name, 'input': tool_input}, indent=2, ensure_ascii=False)}\n"
+                            f"```\n\n"
+                        )
+                    self._file.flush()
+                except Exception as e:
+                    self._file.write(f"\n[md-writer error logging tool {self._tool_name!r}: {e}]\n\n")
+                    self._file.flush()
             self._block_type = None
 
     def _write_thinking(self, text: str) -> None:
