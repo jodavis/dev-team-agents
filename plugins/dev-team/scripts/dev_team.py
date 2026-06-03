@@ -22,6 +22,7 @@ import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
+from uuid import uuid4
 
 # Reconfigure stdout/stderr to UTF-8 early so that Unicode characters in agent
 # output (e.g. arrows, bullets) don't crash on Windows cp1252 terminals.
@@ -162,6 +163,7 @@ class PipelineContext:
     first_push_done: bool = False
     review_threads: list[ReviewThread] = field(default_factory=list)
     review_notes: str = ""
+    signoff_notes: str = ""
     last_failure: str = ""
     build_log: str = ""
     test_log: str = ""
@@ -222,6 +224,8 @@ class PipelineContext:
         )
         lines += ["", "<!-- section:Review Threads -->", "", threads_json]
 
+        lines += ["", "<!-- section:Signoff Notes -->", "", self.signoff_notes.strip()]
+
         if self.last_failure:
             lines += ["", "<!-- section:Last Failure -->", "", self.last_failure.strip()]
 
@@ -273,6 +277,7 @@ class PipelineContext:
             i += 1
         ctx.work_summaries = work_summaries
         ctx.review_notes = sections.get("Review Notes", "")
+        ctx.signoff_notes = sections.get("Signoff Notes", "")
 
         review_threads_json = sections.get("Review Threads", "").strip()
         if review_threads_json:
@@ -464,7 +469,7 @@ class DebugStep(Step):
             )
             sys.exit(1)
         ctx.debug_report = output[marker_pos:]
-        print("Debugging complete.", flush=True)
+        print("[DEV-TEAM] Debug complete", flush=True)
         return "debug_done"
 
 
@@ -506,8 +511,10 @@ class ImplementStep(Step):
     handles = "implementing"
 
     def run(self, ctx: PipelineContext) -> str:
+        print("[DEV-TEAM] Implementation started", flush=True)
         if ctx.work_summaries:
             print("Implementation already complete in context — skipping.", flush=True)
+            print("[DEV-TEAM] Implementation complete", flush=True)
             return "impl_done"
         print(f"Developer is implementing {ctx.work_item_id}...", flush=True)
         try:
@@ -519,11 +526,15 @@ class ImplementStep(Step):
             print(f"Error invoking developer agent:\n{e}", file=sys.stderr)
             sys.exit(1)
         ctx.work_summaries.append(impl_summary)
+        print("[DEV-TEAM] Implementation complete", flush=True)
         return "impl_done"
 
 
 class ValidateStep(Step):
     handles = "validating"
+
+    def __init__(self, context_path: Path) -> None:
+        self._context_path = context_path
 
     def run(self, ctx: PipelineContext) -> str:
         print("Running scripts/validate-build...", flush=True)
@@ -565,6 +576,12 @@ class ValidateStep(Step):
         print(f"Tests clean. Log: {tests_log}", flush=True)
         ctx.last_failure = ""
         _commit_and_push(ctx.work_item_id)
+
+        if not ctx.first_push_done:
+            ctx.first_push_done = True
+            ctx.save(self._context_path)
+            print("[DEV-TEAM] First push complete", flush=True)
+
         return "clean"
 
 
@@ -575,29 +592,6 @@ class ReviewStep(Step):
         self._context_path = context_path
 
     def run(self, ctx: PipelineContext) -> str:
-        if not ctx.pr_url:
-            print(f"Developer is creating PR for {ctx.work_item_id}...", flush=True)
-            try:
-                pr_output = call_agent(
-                    "developer", "developer-create-pr",
-                    substitutions={
-                        "$WORK_ITEM_ID": ctx.work_item_id,
-                        "$PR_URL": ctx.pr_url,
-                        "$TASK_BRIEF": ctx.brief,
-                        "$WORK_SUMMARIES": _format_work_summaries(ctx.work_summaries),
-                    },
-                )
-            except (FileNotFoundError, RuntimeError, subprocess.CalledProcessError) as e:
-                print(f"Error invoking developer-create-pr agent:\n{e}", file=sys.stderr)
-                sys.exit(1)
-            pr_result = parse_json_output(pr_output)
-            if pr_result.get("pr_url"):
-                ctx.pr_url = pr_result["pr_url"]
-                ctx.save(self._context_path)
-            else:
-                print("Error: developer-create-pr did not return a pr_url.", file=sys.stderr)
-                sys.exit(1)
-
         print(f"Reviewer is reviewing {ctx.work_item_id}...", flush=True)
         try:
             output = call_agent(
@@ -606,7 +600,7 @@ class ReviewStep(Step):
                     "$WORK_ITEM_ID": ctx.work_item_id,
                     "$SPEC_PATH": ctx.spec_path,
                     "$TASK_BRIEF": ctx.brief,
-                    "$PR_URL": ctx.pr_url,
+                    "$BASE_BRANCH": ctx.base_branch,
                 },
             )
         except (FileNotFoundError, RuntimeError, subprocess.CalledProcessError) as e:
@@ -614,25 +608,41 @@ class ReviewStep(Step):
             sys.exit(1)
 
         result = parse_json_output(output)
-        if result.get("pr_url"):
-            ctx.pr_url = result["pr_url"]
-        ctx.review_notes = output
+
+        for thread_dict in result.get("threads", []):
+            if "id" not in thread_dict:
+                thread_dict["id"] = uuid4().hex[:8]
+
+        ctx.review_threads = [
+            ReviewThread(
+                id=t["id"],
+                file_path=t["filePath"],
+                line_number=t["lineNumber"],
+                resolved=t.get("resolved", False),
+                comments=[
+                    ReviewComment(author=c["author"], comment=c["comment"])
+                    for c in t.get("comments", [])
+                ],
+            )
+            for t in result.get("threads", [])
+        ]
+        ctx.review_notes = result.get("body", "")
+        ctx.save(self._context_path)
 
         status = result.get("status", "changes_requested")
-        if status == "approved":
-            print("Review approved.", flush=True)
-            return "approved"
-        print("Reviewer requested changes.", flush=True)
-        return "changes_requested"
+        print(f"[DEV-TEAM] Review ready: {status}", flush=True)
+        return status
 
 
 class SignoffStep(Step):
     handles = "signoff"
 
+    def __init__(self, context_path: Path) -> None:
+        self._context_path = context_path
+
     def run(self, ctx: PipelineContext) -> str:
         print(f"Running parallel signoff for {ctx.work_item_id}...", flush=True)
 
-        # Push first so the reviewer-sign-off agent can see the latest commits on the PR.
         _commit_and_push(ctx.work_item_id)
 
         failures: list[str] = []
@@ -660,22 +670,28 @@ class SignoffStep(Step):
                 )
             return True, ""
 
-        def _run_reviewer_signoff() -> tuple[bool, str, str]:
+        def _run_reviewer_signoff() -> tuple[bool, str, list[dict], str]:
+            full_threads_json = json.dumps([{
+                "id": t.id, "filePath": t.file_path, "lineNumber": t.line_number,
+                "resolved": t.resolved,
+                "comments": [{"author": c.author, "comment": c.comment} for c in t.comments],
+            } for t in ctx.review_threads], indent=2)
             try:
                 output = call_agent(
                     "reviewer", "reviewer-sign-off",
                     substitutions={
                         "$WORK_ITEM_ID": ctx.work_item_id,
                         "$TASK_BRIEF": ctx.brief,
-                        "$PR_URL": ctx.pr_url,
+                        "$BASE_BRANCH": ctx.base_branch,
+                        "$REVIEW_THREADS": full_threads_json,
                     },
                 )
             except (FileNotFoundError, RuntimeError, subprocess.CalledProcessError) as e:
-                return False, "", f"reviewer-sign-off error: {e}"
+                return False, f"reviewer-sign-off error: {e}", [], ""
             result = parse_json_output(output)
-            pr_url = result.get("pr_url", "")
-            approved = result.get("status", "changes_requested") == "approved"
-            return approved, pr_url, output if not approved else ""
+            thread_dicts = result.get("threads", [])
+            body = result.get("body", "")
+            return True, "", thread_dicts, body
 
         def _run_researcher_validate() -> tuple[bool, str]:
             try:
@@ -690,7 +706,6 @@ class SignoffStep(Step):
             except (FileNotFoundError, RuntimeError, subprocess.CalledProcessError) as e:
                 return False, f"researcher-validate error: {e}"
 
-            # Parse the JSON array returned by researcher-validate
             try:
                 for block in reversed(re.findall(r"```(?:json)?\s*\n([\s\S]*?)\n```", output)):
                     try:
@@ -712,7 +727,7 @@ class SignoffStep(Step):
                         continue
             except Exception:
                 pass
-            return True, ""  # No parseable JSON — treat as inconclusive pass
+            return True, ""
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             fut_scripts = executor.submit(_run_scripts)
@@ -720,27 +735,60 @@ class SignoffStep(Step):
             fut_researcher = executor.submit(_run_researcher_validate)
 
             scripts_ok, scripts_failure = fut_scripts.result()
-            reviewer_ok, reviewer_pr_url, reviewer_failure = fut_reviewer.result()
+            reviewer_ok, reviewer_error, sign_off_thread_dicts, sign_off_body = fut_reviewer.result()
             researcher_ok, researcher_failure = fut_researcher.result()
 
-        if reviewer_pr_url:
-            ctx.pr_url = reviewer_pr_url
+        # Must be called in main thread (not inside worker thread)
+        if not reviewer_ok or not sign_off_thread_dicts:
+            print(
+                f"Error: sign-off agent failed or returned no threads: {reviewer_error}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Thread merge: Reviewer updates resolved and appends new comments
+        for thread_dict in sign_off_thread_dicts:
+            if "id" not in thread_dict:
+                thread_dict["id"] = uuid4().hex[:8]
+            matched = next((t for t in ctx.review_threads if t.id == thread_dict["id"]), None)
+            if matched is not None:
+                matched.resolved = thread_dict.get("resolved", matched.resolved)
+                new_comments = thread_dict.get("comments", [])
+                if new_comments:
+                    matched.comments.extend([
+                        ReviewComment(author=c["author"], comment=c["comment"])
+                        for c in new_comments
+                    ])
+            else:
+                ctx.review_threads.append(ReviewThread(
+                    id=thread_dict["id"],
+                    file_path=thread_dict.get("filePath", ""),
+                    line_number=thread_dict.get("lineNumber", 0),
+                    resolved=thread_dict.get("resolved", False),
+                    comments=[
+                        ReviewComment(author=c["author"], comment=c["comment"])
+                        for c in thread_dict.get("comments", [])
+                    ],
+                ))
+
+        ctx.signoff_notes = sign_off_body
 
         if not scripts_ok:
             failures.append(scripts_failure)
-        if not reviewer_ok:
-            failures.append(f"Reviewer sign-off:\n{reviewer_failure}")
         if not researcher_ok:
             failures.append(researcher_failure)
 
-        if failures:
+        all_resolved = not any(not t.resolved for t in ctx.review_threads)
+        if failures or not all_resolved:
             ctx.review_notes = "\n\n---\n\n".join(failures)
             ctx.last_failure = ctx.review_notes
-            print("Signoff found issues; requesting further changes.", flush=True)
+            ctx.save(self._context_path)
+            print("[DEV-TEAM] Signoff: changes_requested", flush=True)
             return "changes_requested"
 
         ctx.last_failure = ""
-        print("Signoff approved.", flush=True)
+        ctx.save(self._context_path)
+        print("[DEV-TEAM] Signoff: approved", flush=True)
         return "approved"
 
 
@@ -767,6 +815,7 @@ class FixStep(Step):
                     "$TASK_BRIEF": ctx.brief,
                     "$WORK_SUMMARIES": _format_work_summaries(ctx.work_summaries),
                     "$ISSUES": ctx.last_failure,
+                    "$REVIEW_THREADS": "",
                 },
             )
         except (FileNotFoundError, RuntimeError, subprocess.CalledProcessError) as e:
@@ -779,6 +828,9 @@ class FixStep(Step):
 
 class FixPrStep(Step):
     handles = "fixing-pr"
+
+    def __init__(self, context_path: Path) -> None:
+        self._context_path = context_path
 
     def run(self, ctx: PipelineContext) -> str:
         if ctx.review_fix_iteration >= MAX_REVIEW_FIX_ITERATIONS:
@@ -793,23 +845,44 @@ class FixPrStep(Step):
             f"(iteration {ctx.review_fix_iteration + 1} of {MAX_REVIEW_FIX_ITERATIONS})...",
             flush=True,
         )
-        issues = (
-            f"Code review changes requested on PR {ctx.pr_url}.\n\n"
-            f"Read the open review threads on the PR and address each one.\n\n"
-            f"Reviewer summary:\n{ctx.review_notes}"
-        )
+        unresolved_threads = [t for t in ctx.review_threads if not t.resolved]
+        threads_json = json.dumps([{
+            "id": t.id, "filePath": t.file_path, "lineNumber": t.line_number,
+            "resolved": t.resolved,
+            "comments": [{"author": c.author, "comment": c.comment} for c in t.comments],
+        } for t in unresolved_threads], indent=2)
         try:
             fix_summary = call_agent(
                 "developer", "developer-fix", ctx.work_item_id,
                 substitutions={
                     "$TASK_BRIEF": ctx.brief,
                     "$WORK_SUMMARIES": _format_work_summaries(ctx.work_summaries),
-                    "$ISSUES": issues,
+                    "$REVIEW_THREADS": threads_json,
+                    "$ISSUES": "",
                 },
             )
         except (FileNotFoundError, RuntimeError, subprocess.CalledProcessError) as e:
             print(f"Error invoking developer-fix agent:\n{e}", file=sys.stderr)
             sys.exit(1)
+
+        returned_threads = parse_json_list_output(fix_summary)
+        if not returned_threads:
+            print("Error: developer-fix did not return updated threads.", file=sys.stderr)
+            sys.exit(1)
+
+        # Thread merge: replace comments wholesale, preserve Reviewer's resolved value
+        for thread_dict in returned_threads:
+            matched = next(
+                (t for t in ctx.review_threads if t.id == thread_dict.get("id")), None
+            )
+            if matched is None:
+                continue
+            matched.comments = [
+                ReviewComment(author=c["author"], comment=c["comment"])
+                for c in thread_dict.get("comments", [])
+            ]
+
+        ctx.save(self._context_path)
         ctx.review_fix_iteration += 1
         ctx.work_summaries.append(fix_summary)
         return "fix_done"
@@ -832,11 +905,11 @@ class DevTeamPipeline:
             "debugging": DebugStep(),
             "researching": ResearchStep(research_skill),
             "implementing": ImplementStep(),
-            "validating": ValidateStep(),
+            "validating": ValidateStep(context_path),
             "fixing": FixStep(),
             "reviewing": ReviewStep(context_path),
-            "signoff": SignoffStep(),
-            "fixing-pr": FixPrStep(),
+            "signoff": SignoffStep(context_path),
+            "fixing-pr": FixPrStep(context_path),
         }
 
     def run(self) -> None:
