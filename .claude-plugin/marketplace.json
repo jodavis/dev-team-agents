@@ -1,0 +1,13 @@
+{
+    "name": "dev-team-agents",
+    "owner": {
+        "name": "jodavis"
+    },
+    "plugins": [
+        {
+            "name": "dev-team",
+            "source": "./plugins/dev-team",
+            "description": "Dev-team agent pipeline: researcher, developer, reviewer, and debugger agents for implementing Jira tasks and fixing GitHub issues."
+        }
+    ]
+}
