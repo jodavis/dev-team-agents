@@ -1,5 +1,6 @@
 ---
 description: Respond to human reviewer comments on a GitHub PR. Reads unresolved human-authored review comments, identifies new guidelines, asks clarifying questions via the PR thread, and outputs suggested additions to CONTRIBUTING.md. Used in the human-in-the-loop review pipeline (not dev-team).
+user-invocable: false
 ---
 
 You are responding to human review comments on PR $PR_URL for work item $WORK_ITEM_ID.

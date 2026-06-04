@@ -1,5 +1,6 @@
 ---
 description: First-pass code review for the AdaptiveRemote dev-team pipeline. Creates a GitHub PR if one does not exist, retrieves the PR diff, reviews all changes against requirements and quality criteria, and posts a GitHub PR review. Outputs a JSON result indicating approved or changes_requested.
+user-invocable: false
 ---
 
 You are performing the first-pass code review for work item $WORK_ITEM_ID.

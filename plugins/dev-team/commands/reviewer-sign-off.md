@@ -1,5 +1,6 @@
 ---
 description: Sign-off review for the AdaptiveRemote dev-team pipeline. After the developer has addressed review comments, checks whether each previously requested change has been resolved and scans modified files for new issues. Outputs a JSON result indicating approved or changes_requested.
+user-invocable: false
 ---
 
 You are performing a sign-off review for work item $WORK_ITEM_ID.

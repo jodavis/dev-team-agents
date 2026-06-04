@@ -1,6 +1,7 @@
 ---
 description: Produce a concise task brief for a GitHub issue, synthesized from the issue body and comments, the relevant architecture docs, and source code. Proposes exit criteria since none are written in the issue.
 argument-hint: <Issue-NNN work item ID>
+user-invocable: false
 ---
 
 ## Inputs

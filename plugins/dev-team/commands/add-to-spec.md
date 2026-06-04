@@ -1,6 +1,7 @@
 ---
 description: Add a new requirement or task to an existing _spec_*.md file, iterating with the user until the content is ready
 argument-hint: <Jira issue key or brief description of the new requirement>
+user-invocable: false
 ---
 
 ## Requirement to add

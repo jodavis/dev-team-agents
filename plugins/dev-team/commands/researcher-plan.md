@@ -1,6 +1,7 @@
 ---
 description: Produce a concise task brief for a Jira task, synthesized from its spec file section and the relevant architecture docs and source code
 argument-hint: <Jira task key> <path to spec file>
+user-invocable: false
 ---
 
 ## Inputs

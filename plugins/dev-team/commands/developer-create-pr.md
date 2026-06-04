@@ -1,6 +1,7 @@
 ---
 description: Create a draft GitHub pull request for a completed work item. Determines the correct base branch, writes a developer-authored PR body, and creates the PR as a draft. Idempotent — does nothing if the PR already exists.
 argument-hint: <work-item-id>
+user-invocable: false
 ---
 
 ## Inputs

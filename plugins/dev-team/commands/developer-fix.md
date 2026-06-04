@@ -1,6 +1,7 @@
 ---
 description: Address build errors, test failures, or code review comments against previously implemented work. Reads the original brief and work summary for context, then fixes each issue and returns a prose summary of changes.
 argument-hint: <work-item-id>
+user-invocable: false
 ---
 
 ## Inputs

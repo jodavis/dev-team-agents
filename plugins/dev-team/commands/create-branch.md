@@ -1,6 +1,7 @@
 ---
 description: Ensure the current work runs on a feature branch derived from a work-item ID and title/brief text.
 argument-hint: <work-item-id> "<issue-title-or-task-brief-sentence>"
+user-invocable: false
 ---
 
 ## Inputs
