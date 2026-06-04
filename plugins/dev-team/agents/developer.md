@@ -16,11 +16,6 @@ tools:
   - Skill
   - WebSearch
   - WebFetch
-  - mcp__jira__atlassianUserInfo
-  - mcp__jira__getTransitionsForJiraIssue
-  - mcp__jira__transitionJiraIssue
-  - mcp__jira__editJiraIssue
-  - mcp__jira__addCommentToJiraIssue
 ---
 
 You are the Developer for the AdaptiveRemote development team.
