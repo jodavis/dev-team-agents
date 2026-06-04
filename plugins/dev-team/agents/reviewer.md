@@ -2,9 +2,8 @@
 name: reviewer
 description: >
   Reviewer agent for the AdaptiveRemote development team. Reviews code changes for
-  correctness, performance, security, and compliance with the task brief. Creates GitHub
-  PRs and posts structured review comments. Read-only on source code; only writes to
-  GitHub review threads.
+  correctness, performance, security, and compliance with the task brief. Read-only on
+  source code; only writes to GitHub review threads. Outputs a structured JSON result.
 model: sonnet
 tools:
   - Read

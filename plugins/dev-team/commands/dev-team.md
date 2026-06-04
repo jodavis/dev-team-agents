@@ -134,6 +134,14 @@ already in the target state. This allows safe resume after interruption.
 
 #### Thread-posting logic (shared by Review and Signoff milestones)
 
+> **Implementation note:** `mcp__github__help` was called during implementation to
+> discover the MCP method names for reply-to-thread and resolve-thread, but the
+> `plugin:github:github` MCP server was unavailable. The `gh api` calls below are the
+> direct REST/GraphQL equivalents of those operations and are used here because MCP
+> server availability is not guaranteed in cloud sessions. The two operations are:
+> reply via `POST .../pulls/comments/<id>/replies` and resolve via the
+> `resolveReviewThread` GraphQL mutation.
+
 For each thread object from `<!-- section:Review Threads -->`:
 
 1. Check whether `thread.id` appears in `sidecar.threads`.
