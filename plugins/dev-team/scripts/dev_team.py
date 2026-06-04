@@ -882,8 +882,8 @@ class FixPrStep(Step):
                 for c in thread_dict.get("comments", [])
             ]
 
-        ctx.save(self._context_path)
         ctx.review_fix_iteration += 1
+        ctx.save(self._context_path)
         ctx.work_summaries.append(fix_summary)
         return "fix_done"
 

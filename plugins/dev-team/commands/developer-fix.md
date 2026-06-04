@@ -19,11 +19,22 @@ $WORK_SUMMARIES
 
 ---
 
-### Issues to fix
+### Build/Test Issues
 
 $ISSUES
 
 ---
+
+### Review Threads
+
+$REVIEW_THREADS
+
+---
+
+## Mode detection
+
+- If `$REVIEW_THREADS` is populated: operate in **review-fix mode** (see Step 3).
+- If `$ISSUES` is populated and `$REVIEW_THREADS` is empty: operate in **build/test-fix mode** (see Step 3).
 
 ## Steps
 
@@ -35,18 +46,11 @@ Read `CLAUDE.md` for quality gates and operational conventions.
 ### 2 — Understand context
 
 Read the original task brief and work summary to understand what was built and why. Then
-read each issue to be fixed.
+read each issue or thread to be addressed.
 
-### 3 — Fetch review comment threads from the PR
+### 3 — Fix each issue
 
-If `$ISSUES` contains code review comments (i.e., it references a PR URL), fetch the open
-review comment threads directly from the PR using the GitHub MCP rather than relying solely
-on the summary in `$ISSUES`. This ensures you see all comments including those from human
-reviewers and GitHub Copilot, not only those the orchestrator relayed.
-
-Use `$ISSUES` for non-review-comment issues (build errors, test failures) as provided.
-
-### 4 — Triage
+**Build/test-fix mode** (`$ISSUES` populated, `$REVIEW_THREADS` empty):
 
 For each issue:
 
@@ -55,18 +59,8 @@ For each issue:
 - **Test failure:** before fixing the production code, confirm whether the test itself is
   correct. If the test is wrong, fix the test and explain why in the report. If the test is
   right, write or verify a failing unit test that isolates the defect, then fix the code.
-- **Code review comment:** read the comment and understand the intent.
-  - **Agree:** apply the change.
-  - **Disagree:** post your rationale as a reply to the PR review thread. Do NOT apply the
-    change. The Reviewer will see your response during sign-off and decide whether to accept
-    the rationale or push back. Only apply the change if the Reviewer pushes back in a
-    subsequent round.
-  - In either case, always post a reply to the PR review thread explaining what was done
-    (or why nothing was done). This keeps all reviewers — agent and human — informed.
 
-### 5 — Fix each issue
-
-Address issues one at a time. After each fix:
+After each fix:
 
 1. Build and test only the project(s) you changed to confirm the fix works without
    introducing new failures:
@@ -80,8 +74,7 @@ Address issues one at a time. After each fix:
    tests (no dedicated test class yet), run the full project test instead without `--filter`.
 
    **Scope:** Do **not** run `scripts/validate-build` or `scripts/validate-tests`. Those
-   are full pipeline validation scripts run by the orchestrator after this step — running
-   them here is redundant and slows the fix loop.
+   are full pipeline validation scripts run by the orchestrator after this step.
 
 2. Commit the fix immediately with a message describing the specific issue resolved:
 
@@ -90,16 +83,76 @@ Address issues one at a time. After each fix:
    git commit -m "$ARGUMENTS: <one-line description of what was fixed and why>"
    ```
 
-   One commit per issue keeps the git history readable and makes individual fixes easy to
-   review. Do not batch multiple fixes into a single commit.
+   One commit per issue keeps the git history readable. Do not batch multiple fixes into a
+   single commit.
+
+**Review-fix mode** (`$REVIEW_THREADS` populated):
+
+`$REVIEW_THREADS` is a JSON array of thread objects. Each thread has an `id`, `filePath`,
+`lineNumber`, `resolved` flag, and `comments` array showing the full conversation so far.
+
+For each thread with `"resolved": false`:
+
+- **Agree with the feedback:** apply the requested code change.
+- **Disagree with the feedback:** do not apply the change. Instead, append your rationale
+  as a new entry in the thread's `comments` array:
+  ```json
+  {"author": "Developer", "comment": "<your rationale>"}
+  ```
+  The scrum master will post this reply to GitHub. Do not post directly to GitHub.
+
+After addressing all threads, run the full build and tests to confirm no regressions:
+
+```bash
+dotnet build <project-path>
+dotnet test <test-project-path>
+```
+
+Commit all changes with a single message:
+
+```bash
+git add -A
+git commit -m "$ARGUMENTS: address review feedback"
+```
 
 **Do not push** — the pipeline pushes after all fixes pass full validation.
 
-### 6 — Self-review
+At the end of your response, output the complete updated `threads[]` array as a fenced
+JSON code block. Include **every thread** from `$REVIEW_THREADS` — both the ones you
+addressed and the ones you left unchanged. For each thread, include all prior comments
+as-is; append your `{"author": "Developer", "comment": "..."}` entry only if you are
+disagreeing with the change or need to explain your approach. Do not omit threads — the
+pipeline fails if the returned list is empty.
+
+```json
+[
+  {
+    "id": "a1b2c3d4",
+    "filePath": "src/Example/File.cs",
+    "lineNumber": 42,
+    "resolved": false,
+    "comments": [
+      {"author": "Reviewer", "comment": "<original reviewer comment>"}
+    ]
+  },
+  {
+    "id": "e5f6a7b8",
+    "filePath": "src/Other/File.cs",
+    "lineNumber": 17,
+    "resolved": false,
+    "comments": [
+      {"author": "Reviewer", "comment": "<original reviewer comment>"},
+      {"author": "Developer", "comment": "<your rationale for disagreeing>"}
+    ]
+  }
+]
+```
+
+### 4 — Self-review
 
 Review the diff for unintended scope, missed issues, and convention violations.
 
-### 7 — Report
+### 5 — Report
 
 Return a fix summary as structured prose: for each issue, one sentence describing what was
 changed and why.
