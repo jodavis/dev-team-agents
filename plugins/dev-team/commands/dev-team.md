@@ -134,21 +134,24 @@ already in the target state. This allows safe resume after interruption.
 
 #### Thread-posting logic (shared by Review and Signoff milestones)
 
-> **Implementation note:** `mcp__github__help` was called during implementation to
-> discover the MCP method names for reply-to-thread and resolve-thread, but the
-> `plugin:github:github` MCP server was unavailable. The `gh api` calls below are the
-> direct REST/GraphQL equivalents of those operations and are used here because MCP
-> server availability is not guaranteed in cloud sessions. The two operations are:
-> reply via `POST .../pulls/<pull-num>/comments/<id>/replies` and resolve via the
-> `resolveReviewThread` GraphQL mutation.
+> **Implementation note:** MCP method names were discovered from the
+> `plugin:github:github` server. Reply-to-thread uses
+> `mcp__plugin_github_github__add_reply_to_pull_request_comment` (parameters: `owner`,
+> `repo`, `pullNumber`, `commentId`, `body`). No MCP method exists for resolve-thread;
+> `gh api graphql resolveReviewThread` is the only available mechanism. New inline
+> comment creation similarly has no MCP equivalent and uses `gh api`.
 
 For each thread object from `<!-- section:Review Threads -->`:
 
 1. Check whether `thread.id` appears in `sidecar.threads`.
-2. **If found (existing thread):** reply to the existing GitHub comment:
-   ```bash
-   gh api "repos/${GITHUB_REPOSITORY}/pulls/<pull-num>/comments/<githubCommentId>/replies" \
-     --method POST --field body="<last comment body from thread>"
+2. **If found (existing thread):** reply via MCP:
+   ```
+   mcp__plugin_github_github__add_reply_to_pull_request_comment
+     owner:      <repo-owner>
+     repo:       <repo-name>
+     pullNumber: <pull-num>
+     commentId:  <githubCommentId from sidecar>
+     body:       <last comment body from thread>
    ```
 3. **If not found (new thread):** create a new inline review comment. First get the
    current commit ID (once per milestone): `git rev-parse HEAD`. Then:
