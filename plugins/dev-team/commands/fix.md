@@ -36,6 +36,8 @@ Then stop.
 
 ### 2 — Check the platform
 
+Check the platform to determine which tail command to use in step 4.
+
 ```bash
 python -c "import sys; print(sys.platform)"
 ```
