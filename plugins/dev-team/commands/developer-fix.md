@@ -119,10 +119,10 @@ git commit -m "$ARGUMENTS: address review feedback"
 
 At the end of your response, output the complete updated `threads[]` array as a fenced
 JSON code block. Include **every thread** from `$REVIEW_THREADS` — both the ones you
-addressed and the ones you left unchanged. For each thread you addressed by applying a
-code change, you may leave `comments` empty (the Reviewer will evaluate during sign-off).
-For each thread you disagreed with, append your `{"author": "Developer", "comment": "..."}`
-entry. Do not omit threads — the pipeline fails if the returned list is empty.
+addressed and the ones you left unchanged. For each thread, include all prior comments
+as-is; append your `{"author": "Developer", "comment": "..."}` entry only if you are
+disagreeing with the change or need to explain your approach. Do not omit threads — the
+pipeline fails if the returned list is empty.
 
 ```json
 [
@@ -131,7 +131,9 @@ entry. Do not omit threads — the pipeline fails if the returned list is empty.
     "filePath": "src/Example/File.cs",
     "lineNumber": 42,
     "resolved": false,
-    "comments": []
+    "comments": [
+      {"author": "Reviewer", "comment": "<original reviewer comment>"}
+    ]
   },
   {
     "id": "e5f6a7b8",
