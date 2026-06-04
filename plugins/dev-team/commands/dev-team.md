@@ -139,7 +139,7 @@ already in the target state. This allows safe resume after interruption.
 > `plugin:github:github` MCP server was unavailable. The `gh api` calls below are the
 > direct REST/GraphQL equivalents of those operations and are used here because MCP
 > server availability is not guaranteed in cloud sessions. The two operations are:
-> reply via `POST .../pulls/comments/<id>/replies` and resolve via the
+> reply via `POST .../pulls/<pull-num>/comments/<id>/replies` and resolve via the
 > `resolveReviewThread` GraphQL mutation.
 
 For each thread object from `<!-- section:Review Threads -->`:
@@ -147,7 +147,7 @@ For each thread object from `<!-- section:Review Threads -->`:
 1. Check whether `thread.id` appears in `sidecar.threads`.
 2. **If found (existing thread):** reply to the existing GitHub comment:
    ```bash
-   gh api "repos/${GITHUB_REPOSITORY}/pulls/comments/<githubCommentId>/replies" \
+   gh api "repos/${GITHUB_REPOSITORY}/pulls/<pull-num>/comments/<githubCommentId>/replies" \
      --method POST --field body="<last comment body from thread>"
    ```
 3. **If not found (new thread):** create a new inline review comment. First get the
