@@ -1,6 +1,7 @@
 ---
 description: Review a spec file for implementation readiness — surface blocking questions an implementer would need resolved before writing code
 argument-hint: <path to _spec_*.md file>
+user-invocable: false
 ---
 
 ## Inputs

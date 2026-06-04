@@ -1,6 +1,7 @@
 ---
 description: Reproduce a GitHub issue bug, trace its root cause, and produce a root-cause report.
 argument-hint: <Issue-NNN work item ID>
+user-invocable: false
 ---
 
 ## Inputs

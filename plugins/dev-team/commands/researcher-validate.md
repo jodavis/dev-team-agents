@@ -1,6 +1,7 @@
 ---
 description: Validate completed work against a task's exit criteria, returning a structured pass/fail result for each criterion
 argument-hint: <task key> <path to spec file>
+user-invocable: false
 ---
 
 ## Inputs

@@ -1,6 +1,7 @@
 ---
 description: Implement a feature or bug fix from a Researcher task brief. Writes tests first, then implements, then returns a structured work summary.
 argument-hint: <work-item-id>
+user-invocable: false
 ---
 
 ## Inputs

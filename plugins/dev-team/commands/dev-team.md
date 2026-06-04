@@ -1,6 +1,7 @@
 ---
 description: Entry point for the dev-team agent pipeline. Routes to the correct pipeline based on the work item request, then starts the pipeline script and relays its output.
 argument-hint: <request, e.g. "implement ADR-172" or "fix issue #444">
+user-invocable: false
 ---
 
 ## Request
