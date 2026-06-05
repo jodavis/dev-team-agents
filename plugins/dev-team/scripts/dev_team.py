@@ -883,6 +883,7 @@ class FixPrStep(Step):
             ]
 
         ctx.review_fix_iteration += 1
+        ctx.save(self._context_path)
         ctx.work_summaries.append(fix_summary)
         ctx.save(self._context_path)
         return "fix_done"
