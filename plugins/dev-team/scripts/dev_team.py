@@ -780,7 +780,7 @@ class SignoffStep(Step):
 
         all_resolved = not any(not t.resolved for t in ctx.review_threads)
         if failures or not all_resolved:
-            ctx.review_notes = "\n\n---\n\n".join(failures)
+            ctx.review_notes = ctx.signoff_notes or "\n\n---\n\n".join(failures)
             ctx.last_failure = ctx.review_notes
             ctx.save(self._context_path)
             print("[DEV-TEAM] Signoff: changes_requested", flush=True)
@@ -885,6 +885,7 @@ class FixPrStep(Step):
         ctx.review_fix_iteration += 1
         ctx.save(self._context_path)
         ctx.work_summaries.append(fix_summary)
+        ctx.save(self._context_path)
         return "fix_done"
 
 
