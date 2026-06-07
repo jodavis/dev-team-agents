@@ -1,11 +1,23 @@
 ---
-description: Draft a _spec_*.md design document for a new feature, iterating with the user until the document is ready
-argument-hint: <feature name and description>
+description: Draft a _spec_*.md design document for a new feature or GitHub issue, iterating with the user until the document is ready
+argument-hint: <ADR-nnn | #nnn | feature name and description>
 ---
 
-## Feature to spec
+## Feature or issue to spec
 
 $ARGUMENTS
+
+### Interpreting the argument
+
+Determine the source of the work item before doing anything else:
+
+| Argument form | Source | Action |
+|---------------|--------|--------|
+| `ADR-nnn` (e.g. `ADR-42`) | Jira epic | Fetch the epic via the Jira MCP tool and use its summary and description as the feature brief |
+| `#nnn` (e.g. `#123`) | GitHub issue | Fetch the issue via `gh issue view nnn` and use its title and body as the feature brief |
+| Anything else | Plain text | Use the argument text directly as the feature brief |
+
+Resolve the feature brief before Phase 1 begins. If the Jira epic or GitHub issue does not exist, tell the user and stop.
 
 ## Available architecture docs
 
@@ -20,6 +32,14 @@ always wait for user input at each pause point before continuing.
 
 ### Phase 1 — Orient and gather context
 
+**Step 1 — Resolve the feature brief** (if not already done above):
+Follow the argument-routing table in "Interpreting the argument" to fetch the
+Jira epic or GitHub issue and produce the feature brief before doing anything
+else. In either case, both the main description and discussion comments should
+be considered as source material for the spec. If the source cannot be fetched, 
+tell the user and stop.
+
+**Step 2 — Read architecture docs and source code:**
 Read the relevant `_doc_*.md` files from the list above. Read all that apply
 to the feature area; at minimum read `src/_doc_Projects.md`. Also read any
 relevant source code in the workspace.
@@ -105,9 +125,10 @@ When the user says the document is ready:
    Then update the spec: integrate the answers naturally into the appropriate
    sections (do not append a Q&A block). If the Researcher cited any external
    resources, add them to the `## Related Docs` section.
-   Then repeat from step 1.
-3. When the Researcher returns `No blocking questions — spec is implementation-ready`,
-   tell the user the spec is implementation-ready and proceed to Phase 5.
+3. If the Researcher returned `No blocking questions — spec is implementation-ready`,
+   proceed to step 4. Otherwise repeat from step 1 — but no more than 3 times total.
+   After 3 iterations, proceed to step 4 regardless of the Researcher's output.
+4. Tell the user the spec is implementation-ready and proceed to Phase 5.
 
 ---
 
@@ -115,10 +136,14 @@ When the user says the document is ready:
 
 When Phase 4 is complete:
 
-1. Use `AskUserQuestion` to ask: "Is there a Jira epic for this feature?"
-   Provide options for "Yes — I'll provide the key", "No epic yet", and
-   "No — skip Jira entirely". If the user selects "Yes", follow up with
-   another `AskUserQuestion` (or ask for "Other" input) to collect the key.
+1. Determine whether a Jira epic is already known:
+   - If the original argument was an `ADR-nnn` key, that epic is already
+     known — use it directly and skip the question below.
+   - Otherwise, use `AskUserQuestion` to ask: "Is there a Jira epic for
+     this feature?" Provide options for "Yes — I'll provide the key",
+     "No - Create one for this feature", "No - I'll create one later", and
+     "No — skip Jira entirely". If the user selects "Yes", follow up with
+     another `AskUserQuestion` (or ask for "Other" input) to collect the key.
    **PAUSE — wait for the answer before continuing.**
 2. Add a `## Tasks` section at the end of the spec file. Break the work
    into tasks sized to roughly one PR each. For each task write:
@@ -135,8 +160,11 @@ When Phase 4 is complete:
    **PAUSE — wait for approval or change requests. Apply any changes
    before proceeding.**
 5. Create Jira issues for each item:
-   - For tasks: create as Task issues. If the user provided an epic key,
-     assign it as the parent. If not, create without a parent.
+   - If there is no Jira epic for this feature and the user selected 
+     "No - Create one for this feature" in step 1, create an epic now and
+     save the epic key.
+   - For tasks: create as Task issues. If the user provided an epic key or
+     a new epic was created, assign it as the parent. If not, create without a parent.
    - For "Create epic" placeholder items: create as Epic issues (no parent).
      Use the scope description as the epic summary.
 6. Update the `## Tasks` section: replace each item title with a hyperlink

@@ -58,7 +58,9 @@ If no blocking gaps exist, return exactly:
 If gaps exist, return:
 - A numbered list of concrete questions. Each must be specific enough to resolve the gap,
   reference the section or concept it pertains to, and be a genuine blocker — not a
-  suggestion or style preference.
+  suggestion or style preference. Apply this test: if a reasonable implementer could make
+  a sensible default choice without consulting anyone, it is not a blocker. Only include
+  questions where the implementer would be forced to guess at intended behavior.
 - Under a `## Useful resources` heading: any external resources found in step 4 that
   would inform implementation.
 
