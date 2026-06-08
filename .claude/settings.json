@@ -1,6 +1,6 @@
 {
   "extraKnownMarketplaces": {
-    "dev-team-agents": {
+    "jodavis-agent-plugins": {
       "source": {
         "source": "github",
         "repo": "jodavis/agent-plugins",
@@ -9,6 +9,6 @@
     }
   },
   "enabledPlugins": {
-    "dev-team@dev-team-agents": true
+    "dev-team@jodavis-agent-plugins": true
   }
 }
