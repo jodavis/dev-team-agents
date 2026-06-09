@@ -171,7 +171,9 @@ as part of plugin setup instructions.
 
 _Consequences:_ Context files persist across sessions and machines (when `DEV_TEAM_STATE_DIR`
 points to a synced location). No permission prompts after initial setup. Log files are
-co-located with context files for easy debugging.
+co-located with context files for easy debugging. This path convention supersedes the
+`REPO_ROOT/.claude/dev-team/logs/` path described in `_spec_DevTeamPortability.md` —
+all pipeline file I/O moves to `~/.dev-team/<repo-slug>/`.
 
 ## Planned Implementation
 
@@ -241,40 +243,50 @@ The troubleshooter returns a JSON object:
 
 #### `dev_team.py`
 
-- Remove: subprocess-spawn loop, `call_agent()`, `monitor_process()`, and all `claude -p`
-  invocations.
-- Add: `exit_with_action(descriptor: dict) -> NoReturn` — serialises `descriptor` to JSON,
-  prints to stdout, and calls `sys.exit(0)`.
-- Update: every location that previously called `call_agent()` now calls
-  `exit_with_action({"action": "spawn_agent", "skill": ..., ...})`.
-- Update: context file path computed as
-  `Path(os.environ.get("DEV_TEAM_STATE_DIR", Path.home() / ".dev-team")) / repo_slug / f"{work_item_id}.md"`.
-  `repo_slug` derived from `git remote get-url origin` (slashes replaced with dashes, or
-  kept as path components in a subdirectory — use subdirectory form to avoid flat
-  collisions).
-- Add troubleshooter trigger conditions (see Troubleshooter section below).
+- **Retain:** workflow-file mechanism (`--workflow`, `parse_workflow()`, `WorkflowDefinition`,
+  `StateMachine`). The workflow file still drives which steps the state machine executes;
+  only the agent-spawning exit mechanism changes.
+- **Retain CLI args:** `--workflow`, `--research-skill`, `--plugin-root`. Add `--context-file`
+  as a new required argument (path computed by `dev-team.md` and passed in; no internal
+  fallback computation needed).
+- **Remove:** subprocess-spawn loop, `call_agent()`, `monitor_process()`, and all
+  `claude -p` invocations.
+- **Add:** `exit_with_action(descriptor: dict) -> NoReturn` — serialises `descriptor` to
+  JSON, prints to stdout, and calls `sys.exit(0)`.
+- **Update:** every location that previously called `call_agent()` now calls
+  `exit_with_action({"action": "spawn_agent", "agent": ..., "skill": ..., ...})`.
+- **Add:** troubleshooter trigger conditions (see Troubleshooter section below).
+- **Add:** `consecutive_failures` counter in context file frontmatter, incremented on each
+  parse error or empty agent return, reset to 0 on a successful agent return.
 
 #### `dev-team.md`
 
 Replace the current "start script, monitor output" pattern with an orchestration loop:
 
 ```
-1. Compute context_file path (same algorithm as dev_team.py)
+1. Compute context_file path:
+     base = DEV_TEAM_STATE_DIR env var, or ~/.dev-team if unset
+     repo_slug = strip host + .git from `git remote get-url origin`
+     context_file = <base>/<repo_slug>/<work-item-id>.md
 2. Loop:
    a. Run: python -u ${CLAUDE_PLUGIN_ROOT}/scripts/dev_team.py <work-item-id>
+            --workflow ${CLAUDE_PLUGIN_ROOT}/scripts/<workflow>.md
+            --research-skill <research-skill>
             --plugin-root ${CLAUDE_PLUGIN_ROOT}
             --context-file <context_file>
    b. Parse JSON from stdout (last JSON object on stdout)
    c. If action == "done": report result to user and stop
    d. If action == "spawn_agent" and skill == "troubleshooter":
         Agent(subagent_type="troubleshooter", prompt=<descriptor fields>)
-        If troubleshooter returns action=="terminate": stop and report
-        If troubleshooter returns action=="needs_user_input": ask user, write answer
-          to context file, continue loop
-        If troubleshooter returns action=="continue": continue loop
+        If outcome.action == "terminate": stop and report to user
+        If outcome.action == "needs_user_input":
+          Ask user the troubleshooter's question
+          Write answer to `troubleshooter_input` frontmatter key in context file
+          Continue loop
+        If outcome.action == "continue": continue loop
    e. If action == "spawn_agent" (any other skill):
         Agent(subagent_type="task-runner", prompt=<descriptor fields>)
-        (result is one line — ignore beyond logging it)
+        (result is one line — log it, then continue loop)
    f. Go to step 2
 ```
 
@@ -295,10 +307,13 @@ Responsibilities:
    mid-task reads).
 5. Invoke the skill: `Skill(<skill-name>)`.
 6. Write the skill's output to `write_section` in `context_file` using `Edit`/`Write`.
-7. Respond with **exactly one line**: the appropriate value from `result_format`.
+7. Respond with **exactly one line**: the appropriate value from `result_format`. If the
+   skill's output cannot be mapped to any `result_format` value, write a parse-error note
+   to `<!-- section:Troubleshooter Log -->` in the context file and return `"failed"`.
 
 The task-runner must not add commentary, apologies, or explanation to its response. The
-single-line result is the only output the top-level agent receives.
+single-line result is the only output the top-level agent receives. `write_section`
+**overwrites** the entire named section — no appending.
 
 #### `agents/troubleshooter.md` (new)
 
@@ -338,10 +353,18 @@ Responsibilities:
 | Unknown pipeline state | `unknown_state` | `ctx.state` not in the known state enum |
 | Review loop exceeded | `review_loop` | `review_cycle_count >= N` (existing counter, now routes to troubleshooter instead of hard-stopping) |
 
-`dev_team.py` tracks `signoff_cycle_count` in context file frontmatter. It increments
-`signoff_cycle_count` each time `SignoffStep` returns `changes_requested` and resets it
-to 0 on `approved`. The troubleshooter reads GitHub directly for thread state — no local
-thread tracking is needed in the context file.
+`dev_team.py` tracks the following counters in context file frontmatter:
+
+| Frontmatter key | Incremented when | Reset to 0 when |
+|---|---|---|
+| `signoff_cycle_count` | `SignoffStep` returns `changes_requested` | `SignoffStep` returns `approved` |
+| `consecutive_failures` | agent return is empty or unparseable | any successful agent return |
+| `review_cycle_count` | `ReviewStep` completes a review cycle | `SignoffStep` returns `approved` |
+
+The troubleshooter reads GitHub directly for thread state — no local thread tracking is
+needed in the context file. The `troubleshooter_input` frontmatter key carries user
+answers written by `dev-team.md` after a `needs_user_input` outcome; the troubleshooter
+reads and acts on it at the start of the next invocation, then clears it.
 
 ### Data Flow
 
@@ -384,11 +407,86 @@ dev-team.md (top-level, persistent Claude Code session)
 
 ## Open Questions
 
-- [ ] **`Skill` tool availability in sub-agent sessions:** The current architecture passes
-  skill file content directly to `claude -p`. The task-runner uses the `Skill` tool to
-  invoke skills by name, which requires the plugin's skills to be discoverable from within
-  a spawned sub-agent session. This should be smoke-tested early in the task-runner
-  implementation task before the full protocol is built on top of it.
+_(None — all questions resolved during spec review.)_
+
+## Tasks
+
+> **Legend:** 🤖 = agent task · 🧑 = human operator task
+
+---
+
+### Task 1: Core step-machine — `dev_team.py`, `dev-team.md` loop, and task-runner agent
+
+All three components needed to reach a runnable state. `dev_team.py` exits with a JSON descriptor; `dev-team.md` drives the loop and spawns agents; the task-runner agent wraps the orchestration protocol. None of the three is independently runnable — they ship together.
+
+**`dev_team.py`:**
+- [ ] `--context-file` CLI argument added; context file written to `~/.dev-team/<repo-slug>/<work-item-id>.md`; log files written to `~/.dev-team/<repo-slug>/logs/`
+- [ ] `DEV_TEAM_STATE_DIR` env var overrides the `~/.dev-team` base path
+- [ ] `exit_with_action(descriptor: dict) -> NoReturn` added; serialises descriptor to JSON on stdout and exits 0
+- [ ] `call_agent()`, `monitor_process()`, and all `claude -p` invocations removed; every call site replaced with `exit_with_action({...})`
+- [ ] Workflow-file mechanism (`--workflow`, `parse_workflow()`, `WorkflowDefinition`, `StateMachine`) retained unchanged
+- [ ] `PipelineContext` gains frontmatter fields: `signoff_cycle_count`, `consecutive_failures`, `review_cycle_count`, `troubleshooter_input`
+- [ ] Troubleshooter trigger conditions added (see spec table); each routes to `exit_with_action` with the appropriate trigger field
+- [ ] Unit tests written for: `exit_with_action()`, context path computation (with and without `DEV_TEAM_STATE_DIR`), and counter increment/reset logic for all three counters
+
+**`dev-team.md`:**
+- [ ] Context file path computed from `DEV_TEAM_STATE_DIR` / `~/.dev-team/<repo-slug>/<work-item-id>.md` before the loop starts
+- [ ] Loop invokes `dev_team.py` with `--context-file`, `--workflow`, `--research-skill`, and `--plugin-root`
+- [ ] `action == "done"` branch: reports result to user and stops
+- [ ] `action == "spawn_agent"` (non-troubleshooter) branch: spawns `Agent(subagent_type=<agent>, prompt=<descriptor fields>)`; logs the one-line result
+- [ ] `action == "spawn_agent"` (troubleshooter) branch: spawns troubleshooter agent; handles `continue`, `terminate`, and `needs_user_input` outcomes; writes user answer to `troubleshooter_input` frontmatter key on `needs_user_input`
+- [ ] `run-workflow.md` retired; `implement.md` and `fix.md` updated to invoke the new loop directly
+
+**Task-runner agent (`agents/task-runner.md`):**
+- [ ] Agent defined with tools: `Read`, `Write`, `Edit`, `Skill`, `Bash`, `Glob`, `Grep`
+- [ ] Parses prompt fields: `agent`, `skill`, `context_file`, `read_sections`, `write_section`, `result_format`
+- [ ] Reads `read_sections` from context file and presents them as quoted context before invoking the skill
+- [ ] Passes `context_file` as `$CONTEXT_FILE` to the skill; invokes via `Skill(<skill-name>)`
+- [ ] Overwrites `write_section` in context file with skill output
+- [ ] Returns exactly one line matching a `result_format` value; returns `"failed"` and writes parse-error note to `<!-- section:Troubleshooter Log -->` if output cannot be mapped
+- [ ] Given a pipeline researcher step, when the task-runner is spawned with `skill: researcher-plan`, then the researcher brief is written to the context file and `"briefed"` is returned
+
+---
+
+### Task 2: Environment setup 🧑
+
+One-time operator configuration required before the pipeline can run. No code changes.
+
+- [ ] `GH_TOKEN` set to Claude's GitHub PAT in `~/.claude/settings.json` `env` section (scopes confirmed separately)
+- [ ] `~/.dev-team` added to `permissions.additionalDirectories` in `~/.claude/settings.json` (eliminates per-write permission prompts)
+- [ ] Plugin installation confirmed current (latest changes pulled from `dev-team-agents` repo)
+- [ ] Given `GH_TOKEN` is set to Claude's PAT, when the developer agent runs `gh pr create`, then no account-picker prompt appears
+
+---
+
+### Task 3: End-to-end pipeline validation 🤖
+
+_Depends on Tasks 1 and 2._
+
+Run a full implement pipeline cycle to confirm the step-machine architecture works end-to-end.
+
+- [ ] Given the plugin is installed with `GH_TOKEN` configured and `~/.dev-team` pre-approved, when `/dev-team implement <task>` runs, then `dev-team.md` loops correctly and spawns task-runner agents for each step
+- [ ] Given a full researcher → developer → reviewer → sign-off cycle, when it completes, then the context file at `~/.dev-team/<repo-slug>/<work-item-id>.md` contains all expected sections and no `claude -p` processes are spawned
+- [ ] Given `GH_TOKEN` is set, when the developer agent creates a PR, then no account-picker prompt appears
+- [ ] Sub-agents (researcher, developer, reviewer) successfully make Jira MCP and GitHub MCP calls directly without top-level relay
+
+---
+
+### Task 4: Troubleshooter agent 🤖
+
+_Can run after Task 3 or in parallel. The pipeline is fully functional without it._
+
+Implement `agents/troubleshooter.md` with the sign-off deadlock condition as the first concrete condition and blueprint for future additions.
+
+- [ ] Agent defined with tools: `Read`, `Write`, `Edit`, `Bash`, `Glob`, `Grep`, `AskUserQuestion`, plus inherited MCP tools
+- [ ] Parses prompt fields: `context_file`, `trigger`, and supporting fields
+- [ ] `signoff_deadlock` handler: reads `pr_url` from context file frontmatter; fetches PR review threads via GitHub MCP; identifies threads with developer inability replies that are still `changes_requested`; presents three options to user via `AskUserQuestion`
+- [ ] Override path: posts resolving comment on each flagged thread via GitHub MCP; resets `signoff_cycle_count` to 0; returns `{"action": "continue", ...}`
+- [ ] Reconsider path: posts a note on each flagged thread asking developer to revisit; returns `{"action": "continue", ...}`
+- [ ] Terminate path: returns `{"action": "terminate", "reason": "..."}` with thread URLs
+- [ ] Unknown trigger fallback: returns `{"action": "needs_user_input", "reason": "Unknown trigger: <trigger>. Manual inspection required."}`
+- [ ] Writes diagnosis to `<!-- section:Troubleshooter Log -->` before returning in all cases
+- [ ] Given the pipeline has reached `signoff_cycle_count == 2` with a deadlocked thread, when the troubleshooter runs, then it asks the user how to proceed and acts on the answer without re-running the sign-off
 
 ## Related Epics
 
