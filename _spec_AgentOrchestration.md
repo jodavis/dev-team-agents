@@ -415,7 +415,7 @@ _(None — all questions resolved during spec review.)_
 
 ---
 
-### Task 1: Core step-machine — `dev_team.py`, `dev-team.md` loop, and task-runner agent
+### Task 1: Core step-machine — `dev_team.py`, `dev-team.md` loop, and task-runner agent (ADR-273)
 
 All three components needed to reach a runnable state. `dev_team.py` exits with a JSON descriptor; `dev-team.md` drives the loop and spawns agents; the task-runner agent wraps the orchestration protocol. None of the three is independently runnable — they ship together.
 
@@ -448,7 +448,7 @@ All three components needed to reach a runnable state. `dev_team.py` exits with 
 
 ---
 
-### Task 2: Environment setup 🧑
+### Task 2: Environment setup 🧑 (ADR-274)
 
 One-time operator configuration required before the pipeline can run. No code changes.
 
@@ -459,7 +459,7 @@ One-time operator configuration required before the pipeline can run. No code ch
 
 ---
 
-### Task 3: End-to-end pipeline validation 🤖
+### Task 3: End-to-end pipeline validation 🤖 (ADR-275)
 
 _Depends on Tasks 1 and 2._
 
@@ -472,7 +472,7 @@ Run a full implement pipeline cycle to confirm the step-machine architecture wor
 
 ---
 
-### Task 4: Troubleshooter agent 🤖
+### Task 4: Troubleshooter agent 🤖 (ADR-276)
 
 _Can run after Task 3 or in parallel. The pipeline is fully functional without it._
 
