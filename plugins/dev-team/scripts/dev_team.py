@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
-"""dev-team pipeline orchestrator.
+"""dev-team pipeline step machine.
 
-Entry point: main() — accepts a Jira work item ID, finds the matching spec file,
-and runs the dev-team pipeline. Reentrant: if a context file exists from a prior
-interrupted run, execution resumes from the last completed state.
+Entry point: main() — accepts a Jira work item ID and context file path, runs the
+dev-team pipeline until an agent is needed, then exits with a JSON descriptor on
+stdout (exit code 0). The orchestration loop in dev-team.md re-invokes this script
+after each agent run.
 
 To start fresh, delete the context file:
-  .claude/logs/dev-team/<work-item-id>-context.md
+  ~/.dev-team/<repo-slug>/<work-item-id>.md
 """
 
 import argparse
-import concurrent.futures
 import datetime
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
-import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NoReturn
 
 # Reconfigure stdout/stderr to UTF-8 early so that Unicode characters in agent
 # output (e.g. arrows, bullets) don't crash on Windows cp1252 terminals.
@@ -30,14 +29,69 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-MODEL_MAP = {
-    "haiku": "claude-haiku-4-5-20251001",
-    "sonnet": "claude-sonnet-4-6",
-    "opus": "claude-opus-4-7",
-}
-
 MAX_FIX_ITERATIONS = 5
 MAX_REVIEW_FIX_ITERATIONS = 3
+CONSECUTIVE_FAILURES_THRESHOLD = 3
+SIGNOFF_DEADLOCK_THRESHOLD = 2
+REVIEW_LOOP_THRESHOLD = MAX_REVIEW_FIX_ITERATIONS
+
+
+# ---------------------------------------------------------------------------
+# Step-machine exit protocol
+# ---------------------------------------------------------------------------
+
+def exit_with_action(descriptor: dict) -> NoReturn:
+    """Emit a JSON descriptor on stdout and exit 0.
+
+    Called when the pipeline needs an agent to run. The orchestration loop in
+    dev-team.md parses this output, spawns the agent, then re-invokes the script.
+    """
+    print(json.dumps(descriptor), flush=True)
+    sys.exit(0)
+
+
+def compute_context_path(work_item_id: str, repo_slug: str) -> Path:
+    """Compute the context file path for a work item.
+
+    Base: DEV_TEAM_STATE_DIR env var, or ~/.dev-team if unset.
+    Full path: <base>/<repo_slug>/<work_item_id>.md
+
+    This helper is used by dev-team.md before invoking the script. The script
+    itself receives --context-file as a required argument with no fallback.
+    """
+    base_env = os.environ.get("DEV_TEAM_STATE_DIR")
+    base = Path(base_env) if base_env else Path.home() / ".dev-team"
+    return base / repo_slug / f"{work_item_id}.md"
+
+
+# ---------------------------------------------------------------------------
+# Counter helpers
+# ---------------------------------------------------------------------------
+
+def _apply_counter_updates(ctx: "PipelineContext", step_name: str, trigger: str) -> None:
+    """Update pipeline counters after a step returns a trigger.
+
+    Called by DevTeamPipeline.run() after a step returns normally (not via
+    exit_with_action). The step_name is the state that just completed.
+    """
+    if step_name == "reviewing":
+        ctx.review_cycle_count += 1
+    elif step_name == "signoff":
+        if trigger == "changes_requested":
+            ctx.signoff_cycle_count += 1
+        elif trigger == "approved":
+            ctx.signoff_cycle_count = 0
+            ctx.review_cycle_count = 0
+
+
+def _handle_agent_failure(ctx: "PipelineContext") -> None:
+    """Increment consecutive_failures after an agent return was empty or unparseable."""
+    ctx.consecutive_failures += 1
+
+
+def _handle_agent_success(ctx: "PipelineContext") -> None:
+    """Reset consecutive_failures after any successful agent return."""
+    ctx.consecutive_failures = 0
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +115,6 @@ def parse_workflow(path: Path) -> WorkflowDefinition:
     """
     text = path.read_text(encoding="utf-8")
 
-    # Extract the first ```mermaid ... ``` fenced block.
     match = re.search(r"```mermaid\s*\n(.*?)```", text, re.DOTALL)
     if not match:
         raise ValueError(f"No mermaid fenced block found in {path}")
@@ -75,19 +128,16 @@ def parse_workflow(path: Path) -> WorkflowDefinition:
         if "-->" not in line:
             continue
 
-        # StateA --> [*]  (terminal)
         m = re.match(r"^([\w-]+)\s+-->\s+\[\*\]$", line)
         if m:
             terminal_states.add(m.group(1))
             continue
 
-        # [*] --> StateA  (initial)
         m = re.match(r"^\[\*\]\s+-->\s+([\w-]+)$", line)
         if m:
             initial_state = m.group(1)
             continue
 
-        # StateA --> StateB : trigger
         m = re.match(r"^([\w-]+)\s+-->\s+([\w-]+)\s*:\s*([\w-]+)$", line)
         if m:
             src, dst, trigger = m.group(1), m.group(2), m.group(3)
@@ -107,7 +157,6 @@ def parse_workflow(path: Path) -> WorkflowDefinition:
 # ---------------------------------------------------------------------------
 # State machine
 # ---------------------------------------------------------------------------
-
 
 class StateMachine:
     """Simple state machine backed by a dict-of-dicts transition table."""
@@ -134,7 +183,7 @@ class StateMachine:
 
 @dataclass
 class PipelineContext:
-    """All mutable state for a dev-team pipeline run, persisted across resumptions."""
+    """All mutable state for a dev-team pipeline run, persisted across invocations."""
 
     work_item_id: str
     spec_path: str = ""
@@ -149,6 +198,15 @@ class PipelineContext:
     build_log: str = ""
     test_log: str = ""
     debug_report: str = ""
+    signoff_review: str = ""
+    signoff_research: str = ""
+    # Counters tracked for troubleshooter trigger conditions
+    signoff_cycle_count: int = 0
+    consecutive_failures: int = 0
+    review_cycle_count: int = 0
+    troubleshooter_input: str = ""
+    # Tracks which agent spawn is currently pending (set before exit_with_action)
+    pending_agent: str = ""
     started: datetime.datetime = field(default_factory=datetime.datetime.now)
     last_updated: datetime.datetime = field(default_factory=datetime.datetime.now)
 
@@ -166,6 +224,11 @@ class PipelineContext:
             f"pr_url: {self.pr_url}",
             f"build_log: {self.build_log}",
             f"test_log: {self.test_log}",
+            f"signoff_cycle_count: {self.signoff_cycle_count}",
+            f"consecutive_failures: {self.consecutive_failures}",
+            f"review_cycle_count: {self.review_cycle_count}",
+            f"troubleshooter_input: {self.troubleshooter_input}",
+            f"pending_agent: {self.pending_agent}",
             f"started: {self.started.isoformat()}",
             f"last_updated: {self.last_updated.isoformat()}",
             "---",
@@ -189,6 +252,12 @@ class PipelineContext:
 
         if self.last_failure:
             lines += ["", "<!-- section:Last Failure -->", "", self.last_failure.strip()]
+
+        if self.signoff_review:
+            lines += ["", "<!-- section:Signoff Review -->", "", self.signoff_review.strip()]
+
+        if self.signoff_research:
+            lines += ["", "<!-- section:Signoff Research -->", "", self.signoff_research.strip()]
 
         log_links: list[str] = []
         if self.build_log:
@@ -216,6 +285,11 @@ class PipelineContext:
             pr_url=meta.get("pr_url", ""),
             build_log=meta.get("build_log", ""),
             test_log=meta.get("test_log", ""),
+            signoff_cycle_count=int(meta.get("signoff_cycle_count", 0)),
+            consecutive_failures=int(meta.get("consecutive_failures", 0)),
+            review_cycle_count=int(meta.get("review_cycle_count", 0)),
+            troubleshooter_input=meta.get("troubleshooter_input", ""),
+            pending_agent=meta.get("pending_agent", ""),
         )
 
         try:
@@ -238,6 +312,16 @@ class PipelineContext:
         ctx.work_summaries = work_summaries
         ctx.review_notes = sections.get("Review Notes", "")
         ctx.last_failure = sections.get("Last Failure", "")
+        ctx.signoff_review = sections.get("Signoff Review", "")
+        ctx.signoff_research = sections.get("Signoff Research", "")
+
+        # Parse pr_url from "PR URL" section if not already in frontmatter.
+        if not ctx.pr_url:
+            pr_url_section = sections.get("PR URL", "")
+            if pr_url_section:
+                match = re.search(r"https://github\.com/[^\s]+/pull/\d+", pr_url_section)
+                if match:
+                    ctx.pr_url = match.group(0)
 
         return ctx
 
@@ -268,12 +352,7 @@ def _parse_sections(body: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 def _commit_and_push(work_item_id: str) -> None:
-    """Push the current branch. The developer is expected to have already committed.
-
-    As a safety net, stages and commits any uncommitted changes left by the developer
-    before pushing. The pipeline never pushes until validation is clean, so partial
-    or broken work is never sent to the remote.
-    """
+    """Push the current branch. The developer is expected to have already committed."""
     try:
         subprocess.run(["git", "add", "-A"], check=True, cwd=REPO_ROOT, capture_output=True)
         diff = subprocess.run(
@@ -293,11 +372,7 @@ def _commit_and_push(work_item_id: str) -> None:
 
 
 def parse_json_output(text: str) -> dict:
-    """Extract the last parseable JSON object from agent output text.
-
-    Tries single-line JSON objects from the end of the text first, then
-    fenced code blocks. Returns an empty dict if nothing parses.
-    """
+    """Extract the last parseable JSON object from agent output text."""
     for line in reversed(text.strip().splitlines()):
         line = line.strip()
         if line.startswith("{") and line.endswith("}"):
@@ -317,6 +392,34 @@ def parse_json_output(text: str) -> dict:
     return {}
 
 
+def _troubleshooter_descriptor(
+    trigger: str, context_path: Path, ctx: "PipelineContext"
+) -> dict:
+    """Build the exit descriptor for a troubleshooter spawn."""
+    return {
+        "action": "spawn_agent",
+        "skill": "troubleshooter",
+        "trigger": trigger,
+        "context_file": str(context_path),
+        "cycle_count": ctx.consecutive_failures if trigger == "consecutive_failures"
+                       else ctx.signoff_cycle_count if trigger == "signoff_deadlock"
+                       else ctx.review_cycle_count,
+    }
+
+
+def _check_and_trigger_troubleshooter(
+    trigger: str,
+    threshold: int,
+    count: int,
+    ctx: "PipelineContext",
+    context_path: Path,
+) -> None:
+    """Exit with a troubleshooter descriptor if count has reached threshold."""
+    if count >= threshold:
+        ctx.save(context_path)
+        exit_with_action(_troubleshooter_descriptor(trigger, context_path, ctx))
+
+
 # ---------------------------------------------------------------------------
 # Steps
 # ---------------------------------------------------------------------------
@@ -324,11 +427,11 @@ def parse_json_output(text: str) -> dict:
 class Step(ABC):
     """A single phase of the dev-team pipeline."""
 
-    handles: str  # state name this step is responsible for
+    handles: str
 
     @abstractmethod
     def run(self, ctx: PipelineContext) -> str:
-        """Execute step logic (or skip if already done). Returns a trigger name."""
+        """Execute step logic. Returns a trigger name, OR calls exit_with_action."""
         ...
 
 
@@ -349,102 +452,125 @@ class FindSpecStep(Step):
 class DebugStep(Step):
     handles = "debugging"
 
+    _PENDING_KEY = "debug"
+
+    def __init__(self, context_path: Path) -> None:
+        self._context_path = context_path
+
     def run(self, ctx: PipelineContext) -> str:
         if ctx.debug_report:
-            print("Debug report already in context — skipping.", flush=True)
+            _handle_agent_success(ctx)
+            if "# Debug report for" not in ctx.debug_report:
+                ctx.last_failure = f"Bug could not be reproduced.\n\n{ctx.debug_report}"
+                return "reproduction_failed"
+            print("Debugging complete.", flush=True)
             return "debug_done"
-        print(f"Debugger is investigating {ctx.work_item_id}...", flush=True)
-        try:
-            output = call_agent("debugger", "debugger-investigate", ctx.work_item_id)
-        except (FileNotFoundError, RuntimeError, subprocess.CalledProcessError) as e:
-            print(f"Error invoking debugger agent:\n{e}", file=sys.stderr)
-            sys.exit(1)
 
-        result = parse_json_output(output)
-        status = result.get("status", "reproduced")
-
-        if status == "not_reproduced":
-            reason = result.get("reason", "No reason given.")
-            ctx.last_failure = f"Bug could not be reproduced.\n\n{reason}"
-            print(f"Reproduction failed: {reason}", flush=True)
-            return "reproduction_failed"
-
-        marker = "# Debug report for"
-        marker_pos = output.find(marker)
-        if marker_pos == -1:
-            print(
-                f"Error: debugger did not return a valid report. "
-                f"Expected output containing '# Debug report for'.\n\n"
-                f"Debugger output:\n{output}",
-                file=sys.stderr,
+        if ctx.pending_agent == self._PENDING_KEY:
+            _handle_agent_failure(ctx)
+            _check_and_trigger_troubleshooter(
+                "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
+                ctx.consecutive_failures, ctx, self._context_path,
             )
-            sys.exit(1)
-        ctx.debug_report = output[marker_pos:]
-        print("Debugging complete.", flush=True)
-        return "debug_done"
+
+        print(f"Debugger is investigating {ctx.work_item_id}...", flush=True)
+        ctx.pending_agent = self._PENDING_KEY
+        ctx.save(self._context_path)
+        exit_with_action({
+            "action": "spawn_agent",
+            "agent": "debugger",
+            "skill": "debugger-investigate",
+            "context_file": str(self._context_path),
+            "args": ctx.work_item_id,
+            "read_sections": [],
+            "write_section": "Debug Report",
+            "result_format": "reproduced | not_reproduced",
+        })
 
 
 class ResearchStep(Step):
     handles = "researching"
 
-    def __init__(self, skill: str) -> None:
+    _PENDING_KEY = "research"
+
+    def __init__(self, skill: str, context_path: Path) -> None:
         self._skill = skill
+        self._context_path = context_path
 
     def run(self, ctx: PipelineContext) -> str:
         if ctx.brief:
-            print("Research already complete in context — skipping.", flush=True)
+            _handle_agent_success(ctx)
+            print("Research complete.", flush=True)
             return "research_done"
+
+        if ctx.pending_agent == self._PENDING_KEY:
+            _handle_agent_failure(ctx)
+            _check_and_trigger_troubleshooter(
+                "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
+                ctx.consecutive_failures, ctx, self._context_path,
+            )
+
         print(f"Researcher is planning work for {ctx.work_item_id}...", flush=True)
-        try:
-            brief = call_agent(
-                "researcher", self._skill,
-                ctx.work_item_id, ctx.spec_path,
-                substitutions={"$DEBUG_REPORT": ctx.debug_report},
-            )
-        except (FileNotFoundError, RuntimeError, subprocess.CalledProcessError) as e:
-            print(f"Error invoking researcher agent:\n{e}", file=sys.stderr)
-            sys.exit(1)
-        marker = "# Implementation plan for"
-        marker_pos = brief.find(marker)
-        if marker_pos == -1:
-            print(
-                f"Error: researcher did not return a valid task brief. "
-                f"Expected output containing '# Implementation plan for'.\n\n"
-                f"Researcher output:\n{brief}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        ctx.brief = brief[marker_pos:]
-        return "research_done"
+        read_sections = ["Debug Report"] if ctx.debug_report else []
+        ctx.pending_agent = self._PENDING_KEY
+        ctx.save(self._context_path)
+        exit_with_action({
+            "action": "spawn_agent",
+            "agent": "researcher",
+            "skill": self._skill,
+            "context_file": str(self._context_path),
+            "args": f"{ctx.work_item_id} {ctx.spec_path}",
+            "read_sections": read_sections,
+            "write_section": "Researcher Brief",
+            "result_format": "briefed | failed",
+        })
 
 
 class ImplementStep(Step):
     handles = "implementing"
 
+    _PENDING_KEY = "implement"
+
+    def __init__(self, context_path: Path) -> None:
+        self._context_path = context_path
+
     def run(self, ctx: PipelineContext) -> str:
         if ctx.work_summaries:
+            _handle_agent_success(ctx)
             print("Implementation already complete in context — skipping.", flush=True)
             return "impl_done"
-        print(f"Developer is implementing {ctx.work_item_id}...", flush=True)
-        try:
-            impl_summary = call_agent(
-                "developer", "developer-implement", ctx.work_item_id,
-                substitutions={"$TASK_BRIEF": ctx.brief},
+
+        if ctx.pending_agent == self._PENDING_KEY:
+            _handle_agent_failure(ctx)
+            _check_and_trigger_troubleshooter(
+                "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
+                ctx.consecutive_failures, ctx, self._context_path,
             )
-        except (FileNotFoundError, RuntimeError, subprocess.CalledProcessError) as e:
-            print(f"Error invoking developer agent:\n{e}", file=sys.stderr)
-            sys.exit(1)
-        ctx.work_summaries.append(impl_summary)
-        return "impl_done"
+
+        print(f"Developer is implementing {ctx.work_item_id}...", flush=True)
+        ctx.pending_agent = self._PENDING_KEY
+        ctx.save(self._context_path)
+        exit_with_action({
+            "action": "spawn_agent",
+            "agent": "developer",
+            "skill": "developer-implement",
+            "context_file": str(self._context_path),
+            "read_sections": ["Researcher Brief"],
+            "write_section": "Implementation Summary",
+            "result_format": "implemented | failed | needs_clarification",
+        })
 
 
 class ValidateStep(Step):
     handles = "validating"
 
+    def __init__(self, log_dir: Path) -> None:
+        self._log_dir = log_dir
+
     def run(self, ctx: PipelineContext) -> str:
         print("Running scripts/validate-build...", flush=True)
         try:
-            build_ok, build_log, build_tail = run_validate_script("validate-build")
+            build_ok, build_log, build_tail = run_validate_script("validate-build", self._log_dir)
         except (FileNotFoundError, OSError) as e:
             print(f"Error running validate-build:\n{e}", file=sys.stderr)
             sys.exit(1)
@@ -460,10 +586,9 @@ class ValidateStep(Step):
             return "build_failed"
 
         print(f"Build clean. Log: {build_log}", flush=True)
-
         print("Running scripts/validate-tests...", flush=True)
         try:
-            tests_ok, tests_log, tests_tail = run_validate_script("validate-tests")
+            tests_ok, tests_log, tests_tail = run_validate_script("validate-tests", self._log_dir)
         except (FileNotFoundError, OSError) as e:
             print(f"Error running validate-tests:\n{e}", file=sys.stderr)
             sys.exit(1)
@@ -487,167 +612,174 @@ class ValidateStep(Step):
 class ReviewStep(Step):
     handles = "reviewing"
 
+    _PENDING_CREATE_PR = "create-pr"
+    _PENDING_REVIEW = "reviewer-review"
+
     def __init__(self, context_path: Path) -> None:
         self._context_path = context_path
 
     def run(self, ctx: PipelineContext) -> str:
+        # Sub-step 1: create PR
         if not ctx.pr_url:
-            print(f"Developer is creating PR for {ctx.work_item_id}...", flush=True)
-            try:
-                pr_output = call_agent(
-                    "developer", "developer-create-pr",
-                    substitutions={
-                        "$WORK_ITEM_ID": ctx.work_item_id,
-                        "$PR_URL": ctx.pr_url,
-                        "$TASK_BRIEF": ctx.brief,
-                        "$WORK_SUMMARIES": _format_work_summaries(ctx.work_summaries),
-                    },
+            if ctx.pending_agent == self._PENDING_CREATE_PR:
+                # Re-entry: agent ran but pr_url still not populated
+                _handle_agent_failure(ctx)
+                _check_and_trigger_troubleshooter(
+                    "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
+                    ctx.consecutive_failures, ctx, self._context_path,
                 )
-            except (FileNotFoundError, RuntimeError, subprocess.CalledProcessError) as e:
-                print(f"Error invoking developer-create-pr agent:\n{e}", file=sys.stderr)
-                sys.exit(1)
-            pr_result = parse_json_output(pr_output)
-            if pr_result.get("pr_url"):
-                ctx.pr_url = pr_result["pr_url"]
-                ctx.save(self._context_path)
-            else:
-                print("Error: developer-create-pr did not return a pr_url.", file=sys.stderr)
-                sys.exit(1)
+
+            print(f"Developer is creating PR for {ctx.work_item_id}...", flush=True)
+            read_sections = ["Researcher Brief", "Implementation Summary"]
+            for i in range(1, len(ctx.work_summaries)):
+                read_sections.append(f"Fix {i}")
+            ctx.pending_agent = self._PENDING_CREATE_PR
+            ctx.save(self._context_path)
+            exit_with_action({
+                "action": "spawn_agent",
+                "agent": "developer",
+                "skill": "developer-create-pr",
+                "context_file": str(self._context_path),
+                "read_sections": read_sections,
+                "write_section": "PR URL",
+                "result_format": "pr_created | failed",
+            })
+
+        # Sub-step 2: review
+        if ctx.review_notes:
+            _handle_agent_success(ctx)
+            result = parse_json_output(ctx.review_notes)
+            status = result.get("status", "changes_requested")
+            if status == "approved":
+                print("Review approved.", flush=True)
+                return "approved"
+            print("Reviewer requested changes.", flush=True)
+            return "changes_requested"
+
+        if ctx.pending_agent == self._PENDING_REVIEW:
+            _handle_agent_failure(ctx)
+            _check_and_trigger_troubleshooter(
+                "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
+                ctx.consecutive_failures, ctx, self._context_path,
+            )
 
         print(f"Reviewer is reviewing {ctx.work_item_id}...", flush=True)
-        try:
-            output = call_agent(
-                "reviewer", "reviewer-review",
-                substitutions={
-                    "$WORK_ITEM_ID": ctx.work_item_id,
-                    "$SPEC_PATH": ctx.spec_path,
-                    "$TASK_BRIEF": ctx.brief,
-                    "$PR_URL": ctx.pr_url,
-                },
-            )
-        except (FileNotFoundError, RuntimeError, subprocess.CalledProcessError) as e:
-            print(f"Error invoking reviewer agent:\n{e}", file=sys.stderr)
-            sys.exit(1)
-
-        result = parse_json_output(output)
-        if result.get("pr_url"):
-            ctx.pr_url = result["pr_url"]
-        ctx.review_notes = output
-
-        status = result.get("status", "changes_requested")
-        if status == "approved":
-            print("Review approved.", flush=True)
-            return "approved"
-        print("Reviewer requested changes.", flush=True)
-        return "changes_requested"
+        ctx.pending_agent = self._PENDING_REVIEW
+        ctx.save(self._context_path)
+        exit_with_action({
+            "action": "spawn_agent",
+            "agent": "reviewer",
+            "skill": "reviewer-review",
+            "context_file": str(self._context_path),
+            "read_sections": ["Researcher Brief"],
+            "write_section": "Review Notes",
+            "result_format": "approved | changes_requested",
+        })
 
 
 class SignoffStep(Step):
     handles = "signoff"
 
-    def run(self, ctx: PipelineContext) -> str:
-        print(f"Running parallel signoff for {ctx.work_item_id}...", flush=True)
+    _PENDING_REVIEWER = "signoff-reviewer"
+    _PENDING_RESEARCHER = "signoff-researcher"
 
-        # Push first so the reviewer-sign-off agent can see the latest commits on the PR.
+    def __init__(self, context_path: Path, log_dir: Path) -> None:
+        self._context_path = context_path
+        self._log_dir = log_dir
+
+    def run(self, ctx: PipelineContext) -> str:
+        # Push first so the reviewer can see the latest commits.
         _commit_and_push(ctx.work_item_id)
 
+        # Sub-step 1: reviewer sign-off
+        if not ctx.signoff_review:
+            if ctx.pending_agent == self._PENDING_REVIEWER:
+                _handle_agent_failure(ctx)
+                _check_and_trigger_troubleshooter(
+                    "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
+                    ctx.consecutive_failures, ctx, self._context_path,
+                )
+
+            print(f"Reviewer is signing off {ctx.work_item_id}...", flush=True)
+            ctx.pending_agent = self._PENDING_REVIEWER
+            ctx.save(self._context_path)
+            exit_with_action({
+                "action": "spawn_agent",
+                "agent": "reviewer",
+                "skill": "reviewer-sign-off",
+                "context_file": str(self._context_path),
+                "read_sections": ["Researcher Brief"],
+                "write_section": "Signoff Review",
+                "result_format": "approved | changes_requested",
+            })
+
+        # Sub-step 2: researcher validate
+        if not ctx.signoff_research:
+            if ctx.pending_agent == self._PENDING_RESEARCHER:
+                _handle_agent_failure(ctx)
+                _check_and_trigger_troubleshooter(
+                    "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
+                    ctx.consecutive_failures, ctx, self._context_path,
+                )
+
+            print(f"Researcher is validating {ctx.work_item_id}...", flush=True)
+            read_sections = ["Researcher Brief", "Implementation Summary"]
+            for i in range(1, len(ctx.work_summaries)):
+                read_sections.append(f"Fix {i}")
+            ctx.pending_agent = self._PENDING_RESEARCHER
+            ctx.save(self._context_path)
+            exit_with_action({
+                "action": "spawn_agent",
+                "agent": "researcher",
+                "skill": "researcher-validate",
+                "context_file": str(self._context_path),
+                "read_sections": read_sections,
+                "write_section": "Signoff Research",
+                "result_format": "validated | failed",
+            })
+
+        # Sub-step 3: run scripts in-process
         failures: list[str] = []
 
-        def _run_scripts() -> tuple[bool, str]:
+        try:
+            build_ok, build_log, build_tail = run_validate_script("validate-build", self._log_dir)
+        except (FileNotFoundError, OSError) as e:
+            failures.append(f"validate-build error: {e}")
+            build_ok = False
+
+        if not build_ok and not failures:
+            failures.append(
+                f"Build failed.\n\nFull log: {build_log}\n\nLast 30 lines:\n```\n{build_tail}\n```"
+            )
+
+        if build_ok:
             try:
-                build_ok, build_log, build_tail = run_validate_script("validate-build")
+                tests_ok, tests_log, tests_tail = run_validate_script("validate-tests", self._log_dir)
             except (FileNotFoundError, OSError) as e:
-                return False, f"validate-build error: {e}"
-            if not build_ok:
-                return False, (
-                    f"Build failed.\n\n"
-                    f"Full log: {build_log}\n\n"
-                    f"Last 30 lines:\n```\n{build_tail}\n```"
+                failures.append(f"validate-tests error: {e}")
+                tests_ok = False
+
+            if not tests_ok and not any("validate-tests" in f for f in failures):
+                failures.append(
+                    f"Test failures.\n\nFull log: {tests_log}\n\nLast 30 lines:\n```\n{tests_tail}\n```"
                 )
-            try:
-                tests_ok, tests_log, tests_tail = run_validate_script("validate-tests")
-            except (FileNotFoundError, OSError) as e:
-                return False, f"validate-tests error: {e}"
-            if not tests_ok:
-                return False, (
-                    f"Test failures.\n\n"
-                    f"Full log: {tests_log}\n\n"
-                    f"Last 30 lines:\n```\n{tests_tail}\n```"
-                )
-            return True, ""
 
-        def _run_reviewer_signoff() -> tuple[bool, str, str]:
-            try:
-                output = call_agent(
-                    "reviewer", "reviewer-sign-off",
-                    substitutions={
-                        "$WORK_ITEM_ID": ctx.work_item_id,
-                        "$TASK_BRIEF": ctx.brief,
-                        "$PR_URL": ctx.pr_url,
-                    },
-                )
-            except (FileNotFoundError, RuntimeError, subprocess.CalledProcessError) as e:
-                return False, "", f"reviewer-sign-off error: {e}"
-            result = parse_json_output(output)
-            pr_url = result.get("pr_url", "")
-            approved = result.get("status", "changes_requested") == "approved"
-            return approved, pr_url, output if not approved else ""
+        # Process reviewer sign-off result
+        reviewer_result = parse_json_output(ctx.signoff_review)
+        reviewer_approved = reviewer_result.get("status", "changes_requested") == "approved"
+        if not reviewer_approved:
+            failures.append(f"Reviewer sign-off:\n{ctx.signoff_review}")
 
-        def _run_researcher_validate() -> tuple[bool, str]:
-            try:
-                output = call_agent(
-                    "researcher", "researcher-validate",
-                    ctx.work_item_id, ctx.spec_path,
-                    substitutions={
-                        "$TASK_BRIEF": ctx.brief,
-                        "$WORK_SUMMARIES": _format_work_summaries(ctx.work_summaries),
-                    },
-                )
-            except (FileNotFoundError, RuntimeError, subprocess.CalledProcessError) as e:
-                return False, f"researcher-validate error: {e}"
+        # Process researcher validate result
+        researcher_ok = True
+        if ctx.signoff_research and "failed" in ctx.signoff_research.lower():
+            researcher_ok = False
+            failures.append(f"Research validation:\n{ctx.signoff_research}")
 
-            # Parse the JSON array returned by researcher-validate
-            try:
-                for block in reversed(re.findall(r"```(?:json)?\s*\n([\s\S]*?)\n```", output)):
-                    try:
-                        criteria = json.loads(block.strip())
-                        if isinstance(criteria, list):
-                            failing = [
-                                c for c in criteria
-                                if c.get("status") in ("fail", "partial")
-                            ]
-                            if failing:
-                                details = "\n".join(
-                                    f"- [{c['status'].upper()}] {c['criterion']}: "
-                                    f"{c.get('finding', '')}"
-                                    for c in failing
-                                )
-                                return False, f"Exit criteria not fully met:\n{details}"
-                            return True, ""
-                    except (json.JSONDecodeError, KeyError):
-                        continue
-            except Exception:
-                pass
-            return True, ""  # No parseable JSON — treat as inconclusive pass
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            fut_scripts = executor.submit(_run_scripts)
-            fut_reviewer = executor.submit(_run_reviewer_signoff)
-            fut_researcher = executor.submit(_run_researcher_validate)
-
-            scripts_ok, scripts_failure = fut_scripts.result()
-            reviewer_ok, reviewer_pr_url, reviewer_failure = fut_reviewer.result()
-            researcher_ok, researcher_failure = fut_researcher.result()
-
-        if reviewer_pr_url:
-            ctx.pr_url = reviewer_pr_url
-
-        if not scripts_ok:
-            failures.append(scripts_failure)
-        if not reviewer_ok:
-            failures.append(f"Reviewer sign-off:\n{reviewer_failure}")
-        if not researcher_ok:
-            failures.append(researcher_failure)
+        # Reset sub-step sections for the next signoff cycle
+        ctx.signoff_review = ""
+        ctx.signoff_research = ""
+        ctx.pending_agent = ""
 
         if failures:
             ctx.review_notes = "\n\n---\n\n".join(failures)
@@ -663,7 +795,20 @@ class SignoffStep(Step):
 class FixStep(Step):
     handles = "fixing"
 
+    def __init__(self, context_path: Path) -> None:
+        self._context_path = context_path
+
     def run(self, ctx: PipelineContext) -> str:
+        # Total completed fix summaries before this step runs
+        completed = 1 + ctx.fix_iteration + ctx.review_fix_iteration
+        pending_key = f"fix-{completed}"
+
+        if len(ctx.work_summaries) > completed:
+            # Fix agent wrote a new summary since last iteration
+            _handle_agent_success(ctx)
+            ctx.fix_iteration += 1
+            return "fix_done"
+
         if ctx.fix_iteration >= MAX_FIX_ITERATIONS:
             print(
                 f"Error: still failing after {MAX_FIX_ITERATIONS} fix iterations. "
@@ -671,32 +816,54 @@ class FixStep(Step):
                 file=sys.stderr,
             )
             return "max_retries"
+
+        if ctx.pending_agent == pending_key:
+            _handle_agent_failure(ctx)
+            _check_and_trigger_troubleshooter(
+                "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
+                ctx.consecutive_failures, ctx, self._context_path,
+            )
+
+        write_section = f"Fix {completed}"
         print(
             f"Invoking developer to fix "
             f"(iteration {ctx.fix_iteration + 1} of {MAX_FIX_ITERATIONS})...",
             flush=True,
         )
-        try:
-            fix_summary = call_agent(
-                "developer", "developer-fix", ctx.work_item_id,
-                substitutions={
-                    "$TASK_BRIEF": ctx.brief,
-                    "$WORK_SUMMARIES": _format_work_summaries(ctx.work_summaries),
-                    "$ISSUES": ctx.last_failure,
-                },
-            )
-        except (FileNotFoundError, RuntimeError, subprocess.CalledProcessError) as e:
-            print(f"Error invoking developer-fix agent:\n{e}", file=sys.stderr)
-            sys.exit(1)
-        ctx.fix_iteration += 1
-        ctx.work_summaries.append(fix_summary)
-        return "fix_done"
+        read_sections = ["Researcher Brief", "Last Failure"]
+        if ctx.work_summaries:
+            read_sections.append("Implementation Summary")
+        for i in range(1, len(ctx.work_summaries)):
+            read_sections.append(f"Fix {i}")
+
+        ctx.pending_agent = pending_key
+        ctx.save(self._context_path)
+        exit_with_action({
+            "action": "spawn_agent",
+            "agent": "developer",
+            "skill": "developer-fix",
+            "context_file": str(self._context_path),
+            "read_sections": read_sections,
+            "write_section": write_section,
+            "result_format": "fixed | failed",
+        })
 
 
 class FixPrStep(Step):
     handles = "fixing-pr"
 
+    def __init__(self, context_path: Path) -> None:
+        self._context_path = context_path
+
     def run(self, ctx: PipelineContext) -> str:
+        completed = 1 + ctx.fix_iteration + ctx.review_fix_iteration
+        pending_key = f"fix-pr-{completed}"
+
+        if len(ctx.work_summaries) > completed:
+            _handle_agent_success(ctx)
+            ctx.review_fix_iteration += 1
+            return "fix_done"
+
         if ctx.review_fix_iteration >= MAX_REVIEW_FIX_ITERATIONS:
             print(
                 f"Error: still failing review after {MAX_REVIEW_FIX_ITERATIONS} "
@@ -704,31 +871,35 @@ class FixPrStep(Step):
                 file=sys.stderr,
             )
             return "max_retries"
+
+        if ctx.pending_agent == pending_key:
+            _handle_agent_failure(ctx)
+            _check_and_trigger_troubleshooter(
+                "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
+                ctx.consecutive_failures, ctx, self._context_path,
+            )
+
+        write_section = f"Fix {completed}"
         print(
             f"Invoking developer to address review comments "
             f"(iteration {ctx.review_fix_iteration + 1} of {MAX_REVIEW_FIX_ITERATIONS})...",
             flush=True,
         )
-        issues = (
-            f"Code review changes requested on PR {ctx.pr_url}.\n\n"
-            f"Read the open review threads on the PR and address each one.\n\n"
-            f"Reviewer summary:\n{ctx.review_notes}"
-        )
-        try:
-            fix_summary = call_agent(
-                "developer", "developer-fix", ctx.work_item_id,
-                substitutions={
-                    "$TASK_BRIEF": ctx.brief,
-                    "$WORK_SUMMARIES": _format_work_summaries(ctx.work_summaries),
-                    "$ISSUES": issues,
-                },
-            )
-        except (FileNotFoundError, RuntimeError, subprocess.CalledProcessError) as e:
-            print(f"Error invoking developer-fix agent:\n{e}", file=sys.stderr)
-            sys.exit(1)
-        ctx.review_fix_iteration += 1
-        ctx.work_summaries.append(fix_summary)
-        return "fix_done"
+        read_sections = ["Researcher Brief", "Review Notes", "Implementation Summary"]
+        for i in range(1, len(ctx.work_summaries)):
+            read_sections.append(f"Fix {i}")
+
+        ctx.pending_agent = pending_key
+        ctx.save(self._context_path)
+        exit_with_action({
+            "action": "spawn_agent",
+            "agent": "developer",
+            "skill": "developer-fix",
+            "context_file": str(self._context_path),
+            "read_sections": read_sections,
+            "write_section": write_section,
+            "result_format": "fixed | failed",
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -738,21 +909,29 @@ class FixPrStep(Step):
 class DevTeamPipeline:
     """Drives the dev-team state machine from init (or a resumed state) to done."""
 
-    def __init__(self, ctx: PipelineContext, context_path: Path, workflow: WorkflowDefinition, research_skill: str) -> None:
+    def __init__(
+        self,
+        ctx: PipelineContext,
+        context_path: Path,
+        log_dir: Path,
+        workflow: WorkflowDefinition,
+        research_skill: str,
+    ) -> None:
         self.ctx = ctx
         self.context_path = context_path
+        self.log_dir = log_dir
         self.workflow = workflow
         self.machine = StateMachine(workflow.transitions, initial=ctx.state)
         self.step_handlers: dict[str, Step] = {
             "spec-finding": FindSpecStep(),
-            "debugging": DebugStep(),
-            "researching": ResearchStep(research_skill),
-            "implementing": ImplementStep(),
-            "validating": ValidateStep(),
-            "fixing": FixStep(),
+            "debugging": DebugStep(context_path),
+            "researching": ResearchStep(research_skill, context_path),
+            "implementing": ImplementStep(context_path),
+            "validating": ValidateStep(log_dir),
+            "fixing": FixStep(context_path),
             "reviewing": ReviewStep(context_path),
-            "signoff": SignoffStep(),
-            "fixing-pr": FixPrStep(),
+            "signoff": SignoffStep(context_path, log_dir),
+            "fixing-pr": FixPrStep(context_path),
         }
 
     def run(self) -> None:
@@ -765,20 +944,56 @@ class DevTeamPipeline:
         while self.machine.state not in self.workflow.terminal_states:
             step = self.step_handlers.get(self.machine.state)
             if step is None:
-                raise RuntimeError(f"No handler for state '{self.machine.state}'")
+                # Unknown state — trigger troubleshooter
+                self.ctx.save(self.context_path)
+                exit_with_action({
+                    "action": "spawn_agent",
+                    "skill": "troubleshooter",
+                    "trigger": "unknown_state",
+                    "context_file": str(self.context_path),
+                    "cycle_count": 0,
+                })
 
+            current_state = self.machine.state
             trigger = step.run(self.ctx)
+
+            # step.run() returned normally — update counters
+            _handle_agent_success(self.ctx)
+            _apply_counter_updates(self.ctx, current_state, trigger)
+
+            # Check trigger-based troubleshooter conditions
+            if self.ctx.signoff_cycle_count >= SIGNOFF_DEADLOCK_THRESHOLD:
+                self.ctx.save(self.context_path)
+                exit_with_action(_troubleshooter_descriptor(
+                    "signoff_deadlock", self.context_path, self.ctx
+                ))
+
+            if self.ctx.review_cycle_count >= REVIEW_LOOP_THRESHOLD:
+                self.ctx.save(self.context_path)
+                exit_with_action(_troubleshooter_descriptor(
+                    "review_loop", self.context_path, self.ctx
+                ))
 
             self.machine.transition(trigger)
             self.ctx.state = self.machine.state
             self.ctx.save(self.context_path)
 
-        if self.machine.state == "failed":
-            sys.exit(1)
+        if self.machine.state == "done":
+            exit_with_action({
+                "action": "done",
+                "result": "success",
+                "reason": f"Pipeline completed for {self.ctx.work_item_id}",
+            })
+        else:
+            exit_with_action({
+                "action": "done",
+                "result": "failed",
+                "reason": f"Pipeline ended in state '{self.machine.state}' for {self.ctx.work_item_id}",
+            })
 
 
 # ---------------------------------------------------------------------------
-# Utilities (unchanged from original)
+# Utilities
 # ---------------------------------------------------------------------------
 
 def _find_repo_root() -> Path:
@@ -802,33 +1017,8 @@ REPO_ROOT = _find_repo_root()
 PLUGIN_ROOT: Path = Path(__file__).resolve().parent.parent
 
 
-def _resolve_claude() -> list[str]:
-    """Return the command prefix needed to invoke the claude CLI.
-
-    On Windows, claude is often a .cmd batch wrapper. CreateProcess can't run
-    .cmd files directly — they need cmd.exe. shutil.which resolves the full
-    path (respecting PATHEXT), and we wrap with cmd /c if needed.
-    """
-    path = shutil.which("claude")
-    if path is None:
-        raise RuntimeError(
-            "claude CLI not found on PATH. "
-            "Ensure Claude Code is installed and claude.exe is accessible."
-        )
-    if sys.platform == "win32" and path.lower().endswith(".cmd"):
-        return ["cmd", "/c", path]
-    return [path]
-
-
-CLAUDE_CMD = _resolve_claude()
-
-
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
-    """Split YAML frontmatter from body. Returns (metadata_dict, body).
-
-    Frontmatter is delimited by lines containing only '---'.
-    If no frontmatter is present, returns ({}, text).
-    """
+    """Split YAML frontmatter from body. Returns (metadata_dict, body)."""
     lines = text.split("\n")
     if not lines or lines[0].strip() != "---":
         return {}, text
@@ -873,280 +1063,10 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
     return metadata, body
 
 
-class _MdStreamWriter:
-    """Translates stream_event deltas into formatted markdown in real time.
-
-    Handles three content block types:
-      - thinking  → block quote (> prefix on every line)
-      - text      → plain text, written as-is
-      - tool_use  → JSON code block written on block_stop once the full input is accumulated
-    All other event types are ignored.
-    """
-
-    def __init__(self, file: "IO[str]") -> None:
-        self._file = file
-        self._block_type: str | None = None
-        self._tool_name: str = ""
-        self._tool_json: str = ""
-        self._at_line_start: bool = True  # tracks position within a thinking block
-
-    @staticmethod
-    def _ts() -> str:
-        return datetime.datetime.now().strftime("%H:%M:%S")
-
-    def handle(self, event: dict) -> None:
-        if event.get("type") != "stream_event":
-            return
-        se = event.get("event", {})
-        se_type = se.get("type")
-
-        if se_type == "content_block_start":
-            block = se.get("content_block", {})
-            self._block_type = block.get("type")
-            self._tool_name = block.get("name", "unknown")
-            self._tool_json = ""
-            self._at_line_start = True
-            if self._block_type == "thinking":
-                self._file.write(f"\n**[{self._ts()}]**\n")
-                self._file.flush()
-            elif self._block_type == "text":
-                self._file.write(f"\n**[{self._ts()}]**\n")
-                self._file.flush()
-
-        elif se_type == "content_block_delta":
-            delta = se.get("delta", {})
-            dtype = delta.get("type")
-            if dtype == "thinking_delta" and self._block_type == "thinking":
-                self._write_thinking(delta.get("thinking", ""))
-            elif dtype == "text_delta" and self._block_type == "text":
-                self._file.write(delta.get("text", ""))
-                self._file.flush()
-            elif dtype == "input_json_delta" and self._block_type == "tool_use":
-                self._tool_json += delta.get("partial_json", "")
-
-        elif se_type == "content_block_stop":
-            if self._block_type == "thinking":
-                if not self._at_line_start:
-                    self._file.write("\n")
-                self._file.write("\n")
-                self._file.flush()
-            elif self._block_type == "tool_use":
-                try:
-                    tool_input = json.loads(self._tool_json) if self._tool_json else {}
-                except json.JSONDecodeError:
-                    tool_input = {"raw": self._tool_json}
-                try:
-                    ts = self._ts()
-                    if self._tool_name == "Bash":
-                        self._file.write(
-                            f"\n**[{ts}]**\n"
-                            f"```bash\n"
-                            f"# {tool_input.get('description', '')}\n"
-                            f"{tool_input.get('command', '')}\n"
-                            f"```\n\n"
-                        )
-                    elif self._tool_name == "Read":
-                        self._file.write(
-                            f"\n**[{ts}]**\n"
-                            f"```\n"
-                            f"Reading {tool_input.get('file_path', '')}\n"
-                            f"```\n\n"
-                        )
-                    elif self._tool_name == "Glob":
-                        self._file.write(
-                            f"\n**[{ts}]**\n"
-                            f"```\n"
-                            f"Searching for {tool_input.get('pattern', '')}\n"
-                            f"```\n\n"
-                        )
-                    elif self._tool_name == "Grep":
-                        self._file.write(
-                            f"\n**[{ts}]**\n"
-                            f"```\n"
-                            f"Searching for {tool_input.get('pattern', '')} in {tool_input.get('glob', '')}\n"
-                            f"```\n\n"
-                        )
-                    else:
-                        self._file.write(
-                            f"\n**[{ts}]**\n"
-                            f"```json\n"
-                            f"{json.dumps({'tool': self._tool_name, 'input': tool_input}, indent=2, ensure_ascii=False)}\n"
-                            f"```\n\n"
-                        )
-                    self._file.flush()
-                except Exception as e:
-                    self._file.write(f"\n[md-writer error logging tool {self._tool_name!r}: {e}]\n\n")
-                    self._file.flush()
-            self._block_type = None
-
-    def _write_thinking(self, text: str) -> None:
-        for ch in text:
-            if self._at_line_start:
-                self._file.write("> ")
-                self._at_line_start = False
-            if ch == "\n":
-                self._file.write("\n")
-                self._at_line_start = True
-            else:
-                self._file.write(ch)
-        self._file.flush()
-
-
-def call_agent(
-    agent_name: str,
-    skill_name: str,
-    *args: str,
-    stream: bool = True,
-    substitutions: dict[str, str] | None = None,
-) -> str:
-    """Invoke a Claude agent with a skill via the claude CLI.
-
-    Reads the agent definition for its model and system prompt, reads the skill
-    definition for its instructions, and calls `claude -p` with the combined prompt.
-
-    Args:
-        agent_name:     Name of the agent (matches ../agents/<name>.md).
-        skill_name:     Name of the skill (matches ../commands/<name>.md).
-        *args:          Arguments passed to the skill, substituted for $ARGUMENTS.
-        stream:         If True (default), print output to stdout as it arrives.
-                        Set to False for agents that return structured JSON.
-        substitutions:  Optional dict of {placeholder: value} pairs substituted into
-                        the skill body before $ARGUMENTS is resolved. Use for embedding
-                        structured content (e.g. {"$TASK_BRIEF": brief_text}).
-
-    Returns:
-        The full text output from the agent.
-
-    Raises:
-        FileNotFoundError: Agent or skill definition file not found.
-        RuntimeError: claude CLI not on PATH, or unexpected output format.
-        subprocess.CalledProcessError: claude CLI exited with non-zero status.
-    """
-    agent_path = PLUGIN_ROOT / "agents" / f"{agent_name}.md"
-    skill_path = PLUGIN_ROOT / "commands" / f"{skill_name}.md"
-
-    if not agent_path.exists():
-        raise FileNotFoundError(
-            f"Agent definition not found: {agent_path}"
-        )
-    if not skill_path.exists():
-        raise FileNotFoundError(
-            f"Skill definition not found: {skill_path}"
-        )
-
-    agent_meta, agent_body = _parse_frontmatter(agent_path.read_text(encoding="utf-8"))
-    _, skill_body = _parse_frontmatter(skill_path.read_text(encoding="utf-8"))
-
-    if substitutions:
-        for placeholder, value in substitutions.items():
-            skill_body = skill_body.replace(placeholder, value)
-    arguments_str = " ".join(args)
-    skill_body = skill_body.replace("$ARGUMENTS", arguments_str)
-
-    prompt = f"{agent_body}\n\n---\n\n{skill_body}"
-
-    raw_model = agent_meta.get("model", "sonnet")
-    model = MODEL_MAP.get(raw_model, raw_model)
-
-    # Pass -p without an argument so claude runs in print mode reading from stdin.
-    # Embedding the prompt inline as "-p <prompt>" hits the Windows 32 767-char
-    # CreateProcess limit once build/test output fills $ISSUES.
-    cmd = CLAUDE_CMD + [
-        "-p", "--model", model,
-        "--output-format", "stream-json", "--verbose", "--include-partial-messages"
-    ]
-    tools = agent_meta.get("tools")
-    if isinstance(tools, list) and tools:
-        cmd += ["--allowedTools", ",".join(tools)]
-
-    timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
-    log_dir = REPO_ROOT / ".claude" / "logs" / "dev-team"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"{timestamp}-{agent_name}-{skill_name}.jsonl"
-    md_log_path = log_dir / f"{timestamp}-{agent_name}-{skill_name}.md"
-
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            cwd=REPO_ROOT,
-        )
-    except (FileNotFoundError, OSError) as exc:
-        raise RuntimeError(
-            f"Failed to start claude CLI: {exc}"
-        ) from exc
-
-    # Write the prompt to stdin in a background thread.  Without the thread the
-    # pipe buffer fills up before we start reading stdout, causing a deadlock.
-    def _write_prompt() -> None:
-        try:
-            proc.stdin.write(prompt)  # type: ignore[union-attr]
-            proc.stdin.close()        # type: ignore[union-attr]
-        except BrokenPipeError:
-            pass
-
-    stdin_thread = threading.Thread(target=_write_prompt, daemon=True)
-    stdin_thread.start()
-
-    result_text: str = ""
-    started_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with log_path.open("w", encoding="utf-8") as log_file, \
-         md_log_path.open("w", encoding="utf-8") as md_file:
-        md_file.write(f"# {agent_name} / {skill_name}\n\nStarted: {started_ts}\n\n")
-        md_file.flush()
-        md_writer = _MdStreamWriter(md_file)
-        for line in proc.stdout:  # type: ignore[union-attr]
-            log_file.write(line)
-            log_file.flush()
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            md_writer.handle(event)
-            if event.get("type") == "result" and event.get("subtype") == "success":
-                result_text = event.get("result", "")
-                if stream:
-                    print(result_text, flush=True)
-
-    proc.wait()
-    completed_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with md_log_path.open("a", encoding="utf-8") as md_file:
-        md_file.write(f"\nCompleted: {completed_ts}\n")
-    stderr_text = proc.stderr.read()  # type: ignore[union-attr]
-    if stderr_text:
-        with log_path.open("a", encoding="utf-8") as log_file:
-            log_file.write(json.dumps({"type": "stderr", "text": stderr_text}) + "\n")
-
-    if proc.returncode != 0:
-        raise subprocess.CalledProcessError(
-            proc.returncode,
-            proc.args,
-            stderr=f"{stderr_text}\n(exit code {proc.returncode})",
-        )
-
-    return result_text
-
-
-def _format_work_summaries(summaries: list[str]) -> str:
-    """Format one or more work summaries for embedding in a developer-fix prompt."""
-    if len(summaries) == 1:
-        return summaries[0]
-    parts = []
-    for i, s in enumerate(summaries, start=1):
-        label = "Implementation summary" if i == 1 else f"Fix summary {i - 1}"
-        parts.append(f"### {label}\n\n{s.strip()}")
-    return "\n\n---\n\n".join(parts)
-
-
-def run_validate_script(script_name: str) -> tuple[bool, Path, str]:
+def run_validate_script(script_name: str, log_dir: Path) -> tuple[bool, Path, str]:
     """Run a validate script from the scripts/ directory.
 
-    Logs full output to a timestamped file under .claude/logs/dev-team/.
-    Nothing is streamed to the console — callers print their own status line.
+    Logs full output to a timestamped file under log_dir.
     Returns (success, log_path, tail) where tail is the last 30 lines.
     """
     scripts_dir = REPO_ROOT / "scripts"
@@ -1158,9 +1078,8 @@ def run_validate_script(script_name: str) -> tuple[bool, Path, str]:
             f"Validate script not found: scripts/{script_name}{ext}"
         )
 
-    timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
-    log_dir = REPO_ROOT / ".claude" / "logs" / "dev-team"
     log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
     log_path = log_dir / f"{timestamp}-{script_name}.txt"
 
     if sys.platform == "win32":
@@ -1190,10 +1109,7 @@ def run_validate_script(script_name: str) -> tuple[bool, Path, str]:
 
 
 def find_spec_file(work_item_id: str) -> Path:
-    """Find the unique _spec_*.md file that contains the work item ID.
-
-    Raises SystemExit(1) with a clear message on zero or multiple matches.
-    """
+    """Find the unique _spec_*.md file that contains the work item ID."""
     candidates = [
         p
         for p in REPO_ROOT.rglob("_spec_*.md")
@@ -1233,7 +1149,7 @@ def find_spec_file(work_item_id: str) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="dev_team.py",
-        description="dev-team pipeline orchestrator",
+        description="dev-team pipeline step machine",
     )
     parser.add_argument("work_item_id", metavar="work-item-id",
                         help="Work item ID (e.g. ADR-172 or Issue-444)")
@@ -1243,6 +1159,8 @@ def main() -> None:
                         help="Researcher skill to use (e.g. researcher-plan or researcher-issue)")
     parser.add_argument("--plugin-root", metavar="path", default=None,
                         help="Plugin installation root (agents/ and commands/ resolved here)")
+    parser.add_argument("--context-file", required=True, metavar="path",
+                        help="Path to the pipeline context file (computed by dev-team.md)")
     args = parser.parse_args()
 
     global PLUGIN_ROOT
@@ -1260,22 +1178,25 @@ def main() -> None:
         print(f"Error loading workflow: {e}", file=sys.stderr)
         sys.exit(1)
 
-    log_dir = REPO_ROOT / ".claude" / "logs" / "dev-team"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    context_path = log_dir / f"{work_item_id}-context.md"
+    context_path = Path(args.context_file)
+    log_dir = context_path.parent / "logs"
 
     if context_path.exists():
         ctx = PipelineContext.load(context_path)
         if ctx.state in workflow.terminal_states:
             print(f"Previous run ended with state '{ctx.state}'.")
             print(f"Delete {context_path} to run again.")
-            sys.exit(0 if ctx.state == "done" else 1)
+            exit_with_action({
+                "action": "done",
+                "result": "success" if ctx.state == "done" else "failed",
+                "reason": f"Pipeline previously ended in state '{ctx.state}'",
+            })
         print(f"Resuming {work_item_id} from state '{ctx.state}'...", flush=True)
     else:
         ctx = PipelineContext(work_item_id=work_item_id, state=workflow.initial_state)
         ctx.save(context_path)
 
-    DevTeamPipeline(ctx, context_path, workflow, research_skill=args.research_skill).run()
+    DevTeamPipeline(ctx, context_path, log_dir, workflow, research_skill=args.research_skill).run()
 
 
 if __name__ == "__main__":
