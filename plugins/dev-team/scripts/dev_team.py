@@ -754,20 +754,15 @@ class SignoffStep(Step):
         self._log_dir = log_dir
 
     def _make_run_script_descriptor(self, ctx: PipelineContext) -> dict:
-        """Build a run_script descriptor for validate-build + validate-tests."""
+        """Build a run_script descriptor that waits for PR checks to complete."""
         self._log_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
         log_path = self._log_dir / f"{ctx.work_item_id}-signoff-{timestamp}.log"
         ctx.build_log = str(log_path)
 
-        scripts_dir = REPO_ROOT / "scripts"
-        ext = ".cmd" if sys.platform == "win32" else ".sh"
-        build_script = scripts_dir / f"validate-build{ext}"
-        tests_script = scripts_dir / f"validate-tests{ext}"
-        if sys.platform == "win32":
-            command = f'cmd /c "{build_script}" && cmd /c "{tests_script}"'
-        else:
-            command = f'bash "{build_script}" && bash "{tests_script}"'
+        scripts_dir = Path(__file__).parent
+        wait_script = scripts_dir / "wait-pr-checks.sh"
+        command = f'bash "{wait_script}" "{ctx.pr_url}"'
 
         return {
             "action": "run_script",
