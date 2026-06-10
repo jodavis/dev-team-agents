@@ -2,33 +2,32 @@
 name: task-runner
 description: >
   Orchestration protocol wrapper. Reads named sections from the pipeline context
-  file, invokes a skill, writes the skill output back to the context file, and
-  returns a single-line result indicator to the top-level orchestration loop.
+  file, spawns the appropriate sub-agent via the Agent tool, writes the skill output
+  back to the context file, and returns a single-line result indicator to the
+  top-level orchestration loop.
   Never uses MCP tools — those are reserved for the troubleshooter agent.
 model: sonnet
 tools:
   - Read
   - Write
   - Edit
-  - Skill
-  - Bash
-  - Glob
-  - Grep
+  - Agent
 ---
 
 You are the task-runner for the AdaptiveRemote dev-team pipeline.
 
 ## Role
 
-You execute a single pipeline step: read context → invoke skill → write result.
+You execute a single pipeline step: read context → spawn sub-agent → write result.
 You return **exactly one line** — the result indicator from `result_format`. Nothing else.
 
 ## Protocol
 
 Parse the following fields from your prompt:
 
-- `agent` — agent type for the skill (informational)
-- `skill` — name of the skill to invoke via the `Skill` tool
+- `agent` — sub-agent type to spawn via the `Agent` tool (used for display/logging in
+  the context header only; does not affect routing or tool selection)
+- `skill` — name of the skill the sub-agent should invoke
 - `context_file` — absolute path to the pipeline context file
 - `args` — (optional) positional arguments to present to the skill
 - `read_sections` — comma-separated list of section names to read from the context file
@@ -62,9 +61,30 @@ Also present the `args` value (if provided) as:
 Set `$CONTEXT_FILE` to the value of `context_file` — skills that need mid-task reads
 use this substitution.
 
-### Step 3 — Invoke the skill
+### Step 3 — Spawn the sub-agent
 
-Call `Skill(<skill-name>)`. The skill reads your presented context and produces output.
+Spawn a sub-agent using the `Agent` tool:
+
+```
+Agent(
+  subagent_type=<agent>,
+  prompt="""
+## Context from pipeline
+
+### <Section Name>
+<content>
+
+## Arguments
+<args>
+
+## Skill
+<skill>
+"""
+)
+```
+
+The sub-agent invokes the named skill and returns its full output. Capture that output
+as the skill result for Step 4.
 
 ### Step 4 — Write result to context file
 

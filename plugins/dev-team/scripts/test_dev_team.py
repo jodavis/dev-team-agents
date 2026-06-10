@@ -339,3 +339,188 @@ class TestResearcherValidated:
     def test_empty_string_returns_false(self):
         from dev_team import _researcher_validated
         assert _researcher_validated("") is False
+
+
+# ---------------------------------------------------------------------------
+# --print-context-path CLI flag
+# ---------------------------------------------------------------------------
+
+class TestPrintContextPath:
+    def test_prints_path_and_exits_zero(self, tmp_path, monkeypatch):
+        """--print-context-path should print the path to stdout and exit 0."""
+        monkeypatch.setenv("DEV_TEAM_STATE_DIR", str(tmp_path))
+        result = subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "dev_team.py"),
+             "ADR-123", "--print-context-path", "myorg/myrepo"],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 0
+        expected = str(tmp_path / "myorg" / "myrepo" / "ADR-123.md")
+        assert result.stdout.strip() == expected
+
+    def test_uses_state_dir_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DEV_TEAM_STATE_DIR", str(tmp_path))
+        result = subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "dev_team.py"),
+             "Issue-99", "--print-context-path", "org/repo"],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 0
+        assert "Issue-99.md" in result.stdout
+
+    def test_nothing_on_stderr(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DEV_TEAM_STATE_DIR", str(tmp_path))
+        result = subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "dev_team.py"),
+             "ADR-1", "--print-context-path", "a/b"],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.stderr == ""
+
+
+# ---------------------------------------------------------------------------
+# exit_with_action supports "actions" list (parallel descriptor)
+# ---------------------------------------------------------------------------
+
+class TestExitWithActionParallel:
+    def test_serializes_actions_list(self):
+        descriptor = {
+            "action": "spawn_agent",
+            "message": "Running in parallel.",
+            "actions": [
+                {"agent": "reviewer", "skill": "reviewer-sign-off",
+                 "context_file": "/tmp/ctx.md", "read_sections": [],
+                 "write_section": "Signoff Review", "result_format": "approved | changes_requested"},
+                {"agent": "researcher", "skill": "researcher-validate",
+                 "context_file": "/tmp/ctx.md", "read_sections": ["Researcher Brief"],
+                 "write_section": "Signoff Research", "result_format": "validated | failed"},
+            ],
+        }
+        result = _run_exit_with_action(descriptor)
+        assert result.returncode == 0
+        parsed = json.loads(result.stdout.strip())
+        assert parsed["action"] == "spawn_agent"
+        assert len(parsed["actions"]) == 2
+        assert parsed["actions"][0]["skill"] == "reviewer-sign-off"
+        assert parsed["actions"][1]["skill"] == "researcher-validate"
+
+
+# ---------------------------------------------------------------------------
+# message field in exit_with_action descriptors
+# ---------------------------------------------------------------------------
+
+class TestExitWithActionMessage:
+    def test_message_field_is_serialized(self):
+        descriptor = {
+            "action": "spawn_agent",
+            "message": "Developer is implementing.",
+            "agent": "developer",
+            "skill": "developer-implement",
+        }
+        result = _run_exit_with_action(descriptor)
+        assert result.returncode == 0
+        parsed = json.loads(result.stdout.strip())
+        assert parsed["message"] == "Developer is implementing."
+
+    def test_descriptor_without_message_still_valid(self):
+        """Backward-compat: descriptors without 'message' still work."""
+        descriptor = {"action": "done", "result": "success"}
+        result = _run_exit_with_action(descriptor)
+        assert result.returncode == 0
+        parsed = json.loads(result.stdout.strip())
+        assert "message" not in parsed
+
+
+# ---------------------------------------------------------------------------
+# ReviewStep pr_url extraction from "PR URL" section
+# ---------------------------------------------------------------------------
+
+class TestReviewStepPrUrlExtraction:
+    def make_sut(self, **kwargs):
+        from dev_team import PipelineContext
+        return PipelineContext(work_item_id="ADR-TEST", **kwargs)
+
+    def test_pr_url_saved_to_frontmatter_after_extraction(self, tmp_path):
+        """When pending_agent==create-pr and PR URL section is written, pr_url lands in frontmatter."""
+        from dev_team import PipelineContext
+        ctx = self.make_sut(
+            state="reviewing",
+            pending_agent="create-pr",
+            work_summaries=["# Summary"],
+        )
+        context_path = tmp_path / "ctx.md"
+        ctx.save(context_path)
+
+        # Simulate task-runner writing the PR URL section
+        text = context_path.read_text(encoding="utf-8")
+        text += "\n<!-- section:PR URL -->\n\nhttps://github.com/org/repo/pull/42\n"
+        context_path.write_text(text, encoding="utf-8")
+
+        # load() should NOT pick up pr_url from section (fallback removed)
+        loaded = PipelineContext.load(context_path)
+        assert loaded.pr_url == ""
+
+    def test_load_does_not_fallback_to_pr_url_section(self, tmp_path):
+        """After removing the fallback, pr_url from section is NOT loaded automatically."""
+        from dev_team import PipelineContext
+        ctx = self.make_sut()
+        path = tmp_path / "ctx.md"
+        ctx.save(path)
+        text = path.read_text(encoding="utf-8")
+        text += "\n<!-- section:PR URL -->\n\nhttps://github.com/org/repo/pull/99\n"
+        path.write_text(text, encoding="utf-8")
+        loaded = PipelineContext.load(path)
+        # Section fallback removed — pr_url should be empty
+        assert loaded.pr_url == ""
+
+    def test_pr_url_in_frontmatter_is_loaded(self, tmp_path):
+        """pr_url set explicitly in frontmatter IS loaded correctly."""
+        from dev_team import PipelineContext
+        ctx = self.make_sut(pr_url="https://github.com/org/repo/pull/7")
+        path = tmp_path / "ctx.md"
+        ctx.save(path)
+        loaded = PipelineContext.load(path)
+        assert loaded.pr_url == "https://github.com/org/repo/pull/7"
+
+
+# ---------------------------------------------------------------------------
+# _get_failing_pr_checks
+# ---------------------------------------------------------------------------
+
+class TestGetFailingPrChecks:
+    def test_returns_empty_when_gh_not_found(self, monkeypatch):
+        """Returns empty string when gh CLI is not available."""
+        from unittest.mock import patch
+        from dev_team import _get_failing_pr_checks
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            result = _get_failing_pr_checks("https://github.com/org/repo/pull/1")
+        assert result == ""
+
+    def test_returns_empty_on_timeout(self):
+        from unittest.mock import patch
+        import subprocess as sp
+        from dev_team import _get_failing_pr_checks
+        with patch("subprocess.run", side_effect=sp.TimeoutExpired(cmd="gh", timeout=60)):
+            result = _get_failing_pr_checks("https://github.com/org/repo/pull/1")
+        assert result == ""
+
+    def test_returns_failing_lines_when_present(self):
+        from unittest.mock import patch, MagicMock
+        from dev_team import _get_failing_pr_checks
+        mock_result = MagicMock()
+        mock_result.stdout = "build\tpass\nbuild-test\tfail\nlint\tpass\n"
+        mock_result.stderr = ""
+        with patch("subprocess.run", return_value=mock_result):
+            result = _get_failing_pr_checks("https://github.com/org/repo/pull/1")
+        assert "fail" in result
+        assert "pass" not in result or "fail" in result
+
+    def test_returns_empty_when_all_pass(self):
+        from unittest.mock import patch, MagicMock
+        from dev_team import _get_failing_pr_checks
+        mock_result = MagicMock()
+        mock_result.stdout = "build\tpass\nlint\tpass\n"
+        mock_result.stderr = ""
+        with patch("subprocess.run", return_value=mock_result):
+            result = _get_failing_pr_checks("https://github.com/org/repo/pull/1")
+        assert result == ""

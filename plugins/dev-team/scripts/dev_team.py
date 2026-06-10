@@ -315,14 +315,6 @@ class PipelineContext:
         ctx.signoff_review = sections.get("Signoff Review", "")
         ctx.signoff_research = sections.get("Signoff Research", "")
 
-        # Parse pr_url from "PR URL" section if not already in frontmatter.
-        if not ctx.pr_url:
-            pr_url_section = sections.get("PR URL", "")
-            if pr_url_section:
-                match = re.search(r"https://github\.com/[^\s]+/pull/\d+", pr_url_section)
-                if match:
-                    ctx.pr_url = match.group(0)
-
         return ctx
 
 
@@ -350,6 +342,30 @@ def _parse_sections(body: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _get_failing_pr_checks(pr_url: str) -> str:
+    """Run `gh pr checks <pr_url>` and return output for failing checks.
+
+    Returns a string with failing check lines, or empty string if all pass or
+    if gh is unavailable / the command fails.
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "checks", pr_url],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        output = result.stdout + result.stderr
+        # Return lines that indicate a failing check (non-passing status)
+        failing_lines = [
+            line for line in output.splitlines()
+            if any(word in line.lower() for word in ("fail", "error", "x "))
+        ]
+        return "\n".join(failing_lines) if failing_lines else ""
+    except (FileNotFoundError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
+        return ""
+
 
 def _commit_and_push(work_item_id: str) -> None:
     """Push the current branch. The developer is expected to have already committed."""
@@ -423,6 +439,7 @@ def _troubleshooter_descriptor(
     """Build the exit descriptor for a troubleshooter spawn."""
     return {
         "action": "spawn_agent",
+        "message": f"Pipeline issue detected (trigger: {trigger}). Troubleshooter is intervening.",
         "skill": "troubleshooter",
         "trigger": trigger,
         "context_file": str(context_path),
@@ -503,6 +520,7 @@ class DebugStep(Step):
         ctx.save(self._context_path)
         exit_with_action({
             "action": "spawn_agent",
+            "message": f"Debugger is investigating {ctx.work_item_id}.",
             "agent": "debugger",
             "skill": "debugger-investigate",
             "context_file": str(self._context_path),
@@ -541,6 +559,7 @@ class ResearchStep(Step):
         ctx.save(self._context_path)
         exit_with_action({
             "action": "spawn_agent",
+            "message": f"Researcher is planning work for {ctx.work_item_id}.",
             "agent": "researcher",
             "skill": self._skill,
             "context_file": str(self._context_path),
@@ -577,6 +596,7 @@ class ImplementStep(Step):
         ctx.save(self._context_path)
         exit_with_action({
             "action": "spawn_agent",
+            "message": "Researcher has written the task brief. Developer is now implementing.",
             "agent": "developer",
             "skill": "developer-implement",
             "context_file": str(self._context_path),
@@ -647,13 +667,25 @@ class ReviewStep(Step):
         # Sub-step 1: create PR
         if not ctx.pr_url:
             if ctx.pending_agent == self._PENDING_CREATE_PR:
-                # Re-entry: agent ran but pr_url still not populated
-                _handle_agent_failure(ctx)
-                _check_and_trigger_troubleshooter(
-                    "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
-                    ctx.consecutive_failures, ctx, self._context_path,
-                )
+                # Re-entry: try to extract pr_url written to the "PR URL" section.
+                text = self._context_path.read_text(encoding="utf-8")
+                _, body = _parse_frontmatter(text)
+                sections = _parse_sections(body)
+                pr_url_section = sections.get("PR URL", "")
+                if pr_url_section:
+                    m = re.search(r"https://github\.com/[^\s]+/pull/\d+", pr_url_section)
+                    if m:
+                        ctx.pr_url = m.group(0)
+                        ctx.save(self._context_path)
+                if not ctx.pr_url:
+                    # Agent ran but pr_url still not populated — treat as failure.
+                    _handle_agent_failure(ctx)
+                    _check_and_trigger_troubleshooter(
+                        "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
+                        ctx.consecutive_failures, ctx, self._context_path,
+                    )
 
+        if not ctx.pr_url:
             print(f"Developer is creating PR for {ctx.work_item_id}...", flush=True)
             read_sections = ["Researcher Brief", "Implementation Summary"]
             for i in range(1, len(ctx.work_summaries)):
@@ -662,6 +694,7 @@ class ReviewStep(Step):
             ctx.save(self._context_path)
             exit_with_action({
                 "action": "spawn_agent",
+                "message": "Implementation complete. Developer is creating a pull request.",
                 "agent": "developer",
                 "skill": "developer-create-pr",
                 "context_file": str(self._context_path),
@@ -693,6 +726,7 @@ class ReviewStep(Step):
         ctx.save(self._context_path)
         exit_with_action({
             "action": "spawn_agent",
+            "message": "Pull request created. Reviewer is reviewing the changes.",
             "agent": "reviewer",
             "skill": "reviewer-review",
             "context_file": str(self._context_path),
@@ -707,6 +741,7 @@ class SignoffStep(Step):
 
     _PENDING_REVIEWER = "signoff-reviewer"
     _PENDING_RESEARCHER = "signoff-researcher"
+    _PENDING_PARALLEL = "signoff-parallel"
 
     def __init__(self, context_path: Path, log_dir: Path) -> None:
         self._context_path = context_path
@@ -716,7 +751,50 @@ class SignoffStep(Step):
         # Push first so the reviewer can see the latest commits.
         _commit_and_push(ctx.work_item_id)
 
-        # Sub-step 1: reviewer sign-off
+        # Sub-step 1 & 2: spawn reviewer and researcher in parallel when both are absent.
+        if not ctx.signoff_review and not ctx.signoff_research:
+            if ctx.pending_agent in (self._PENDING_REVIEWER, self._PENDING_RESEARCHER,
+                                     self._PENDING_PARALLEL):
+                # Re-entry after parallel spawn with no results — treat as failure.
+                _handle_agent_failure(ctx)
+                _check_and_trigger_troubleshooter(
+                    "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
+                    ctx.consecutive_failures, ctx, self._context_path,
+                )
+
+            print(f"Spawning reviewer and researcher in parallel for {ctx.work_item_id}...",
+                  flush=True)
+            read_sections_researcher = ["Researcher Brief", "Implementation Summary"]
+            for i in range(1, len(ctx.work_summaries)):
+                read_sections_researcher.append(f"Fix {i}")
+            ctx.pending_agent = self._PENDING_PARALLEL
+            ctx.save(self._context_path)
+            exit_with_action({
+                "action": "spawn_agent",
+                "message": (
+                    "Entering signoff phase. Reviewer and researcher are running in parallel."
+                ),
+                "actions": [
+                    {
+                        "agent": "reviewer",
+                        "skill": "reviewer-sign-off",
+                        "context_file": str(self._context_path),
+                        "read_sections": ["Researcher Brief"],
+                        "write_section": "Signoff Review",
+                        "result_format": "approved | changes_requested",
+                    },
+                    {
+                        "agent": "researcher",
+                        "skill": "researcher-validate",
+                        "context_file": str(self._context_path),
+                        "read_sections": read_sections_researcher,
+                        "write_section": "Signoff Research",
+                        "result_format": "validated | failed",
+                    },
+                ],
+            })
+
+        # Sub-step 1: reviewer sign-off (fallback: only reviewer missing after parallel)
         if not ctx.signoff_review:
             if ctx.pending_agent == self._PENDING_REVIEWER:
                 _handle_agent_failure(ctx)
@@ -730,6 +808,7 @@ class SignoffStep(Step):
             ctx.save(self._context_path)
             exit_with_action({
                 "action": "spawn_agent",
+                "message": "Researcher validated. Reviewer is performing final sign-off.",
                 "agent": "reviewer",
                 "skill": "reviewer-sign-off",
                 "context_file": str(self._context_path),
@@ -741,7 +820,7 @@ class SignoffStep(Step):
         # signoff_review is populated — reviewer agent succeeded
         _handle_agent_success(ctx)
 
-        # Sub-step 2: researcher validate
+        # Sub-step 2: researcher validate (fallback: only researcher missing after parallel)
         if not ctx.signoff_research:
             if ctx.pending_agent == self._PENDING_RESEARCHER:
                 _handle_agent_failure(ctx)
@@ -758,6 +837,7 @@ class SignoffStep(Step):
             ctx.save(self._context_path)
             exit_with_action({
                 "action": "spawn_agent",
+                "message": "Reviewer signed off. Researcher is validating exit criteria.",
                 "agent": "researcher",
                 "skill": "researcher-validate",
                 "context_file": str(self._context_path),
@@ -766,7 +846,7 @@ class SignoffStep(Step):
                 "result_format": "validated | failed",
             })
 
-        # signoff_research is populated — researcher-validate agent succeeded
+        # Both signoff_review and signoff_research are populated — both agents succeeded
         _handle_agent_success(ctx)
 
         # Sub-step 3: run scripts in-process
@@ -870,6 +950,10 @@ class FixStep(Step):
         ctx.save(self._context_path)
         exit_with_action({
             "action": "spawn_agent",
+            "message": (
+                f"Build or tests failed. Developer is fixing "
+                f"(iteration {ctx.fix_iteration + 1} of {MAX_FIX_ITERATIONS})."
+            ),
             "agent": "developer",
             "skill": "developer-fix",
             "context_file": str(self._context_path),
@@ -920,10 +1004,24 @@ class FixPrStep(Step):
         for i in range(1, len(ctx.work_summaries)):
             read_sections.append(f"Fix {i}")
 
+        # When a PR exists, include failing GitHub Actions check output in the fix context
+        # instead of running validate scripts in-process.
+        if ctx.pr_url:
+            pr_checks_output = _get_failing_pr_checks(ctx.pr_url)
+            if pr_checks_output:
+                ctx.last_failure = (
+                    f"{ctx.review_notes}\n\n"
+                    f"Failing GitHub Actions checks:\n```\n{pr_checks_output}\n```"
+                )
+
         ctx.pending_agent = pending_key
         ctx.save(self._context_path)
         exit_with_action({
             "action": "spawn_agent",
+            "message": (
+                f"Review requested changes. Developer is addressing review comments "
+                f"(iteration {ctx.review_fix_iteration + 1} of {MAX_REVIEW_FIX_ITERATIONS})."
+            ),
             "agent": "developer",
             "skill": "developer-fix",
             "context_file": str(self._context_path),
@@ -979,6 +1077,7 @@ class DevTeamPipeline:
                 self.ctx.save(self.context_path)
                 exit_with_action({
                     "action": "spawn_agent",
+                    "message": "Pipeline entered an unknown state. Troubleshooter is intervening.",
                     "skill": "troubleshooter",
                     "trigger": "unknown_state",
                     "context_file": str(self.context_path),
@@ -1182,15 +1281,30 @@ def main() -> None:
     )
     parser.add_argument("work_item_id", metavar="work-item-id",
                         help="Work item ID (e.g. ADR-172 or Issue-444)")
-    parser.add_argument("--workflow", required=True, metavar="path",
+    parser.add_argument("--workflow", metavar="path", default=None,
                         help="Path to a Mermaid stateDiagram-v2 workflow file")
-    parser.add_argument("--research-skill", required=True, metavar="skill",
+    parser.add_argument("--research-skill", metavar="skill", default=None,
                         help="Researcher skill to use (e.g. researcher-plan or researcher-issue)")
     parser.add_argument("--plugin-root", metavar="path", default=None,
                         help="Plugin installation root (agents/ and commands/ resolved here)")
-    parser.add_argument("--context-file", required=True, metavar="path",
+    parser.add_argument("--context-file", metavar="path", default=None,
                         help="Path to the pipeline context file (computed by dev-team.md)")
+    parser.add_argument("--print-context-path", metavar="repo-slug", default=None,
+                        help="Print the context file path for the given repo slug and exit")
     args = parser.parse_args()
+
+    # --print-context-path mode: compute and print the context file path, then exit.
+    if args.print_context_path is not None:
+        print(compute_context_path(args.work_item_id, args.print_context_path), flush=True)
+        sys.exit(0)
+
+    # Normal pipeline mode requires --workflow, --research-skill, and --context-file.
+    if not args.workflow:
+        parser.error("--workflow is required")
+    if not args.research_skill:
+        parser.error("--research-skill is required")
+    if not args.context_file:
+        parser.error("--context-file is required")
 
     global PLUGIN_ROOT
     if args.plugin_root:

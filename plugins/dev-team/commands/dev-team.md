@@ -37,20 +37,17 @@ appropriate agent for each step.
 git remote get-url origin
 ```
 
-Strip the host prefix and `.git` suffix from the URL to form the repo slug
+Strip the host prefix and `.git` suffix from the URL to form `<repo-slug>`
 (e.g. `https://github.com/jodavis/AdaptiveRemote.git` → `jodavis/AdaptiveRemote`).
 
-Read the `DEV_TEAM_STATE_DIR` environment variable. If set, use it as the base path.
-Otherwise, use `~/.dev-team` (expand `~` to the actual home directory).
-
-Compute:
-```
-context_file = <base>/<repo-slug>/<work-item-id>.md
+Then compute the context file path:
+```bash
+context_file=$(python ${CLAUDE_PLUGIN_ROOT}/scripts/dev_team.py <work-item-id> --print-context-path <repo-slug>)
 ```
 
 Create the directory if it does not exist:
 ```bash
-mkdir -p "<base>/<repo-slug>"
+mkdir -p "$(dirname "$context_file")"
 ```
 
 ### 2 — Orchestration loop
@@ -71,7 +68,12 @@ Capture all stdout. The last JSON object on stdout is the action descriptor.
 
 #### 2b — Parse the descriptor
 
+Display any non-JSON stdout lines as status updates to the user.
+
 Extract the last line from stdout that is a valid JSON object.
+
+If the descriptor contains a `"message"` field, display it to the user before
+spawning the next agent.
 
 #### 2c — Branch on action
 
@@ -106,13 +108,39 @@ Handle the outcome (a JSON object with `action` field):
      path = Path('<context_file>')
      answer = sys.stdin.read().strip()
      text = path.read_text(encoding='utf-8')
-     text = re.sub(r'troubleshooter_input:.*', f'troubleshooter_input: {answer}', text)
+     text = re.sub(r'troubleshooter_input:.*', lambda m: f'troubleshooter_input: {answer}', text)
      path.write_text(text, encoding='utf-8')
      " <<'ANSWER_HEREDOC'
      <user_answer>
      ANSWER_HEREDOC
      ```
   3. Continue the loop
+
+**If `action == "spawn_agent"` and descriptor contains an `"actions"` list:**
+
+Spawn all agents in parallel using multiple `Agent(...)` calls and await all results:
+
+```
+results = await [
+  Agent(subagent_type="task-runner", prompt="""
+agent: <action.agent>
+skill: <action.skill>
+context_file: <action.context_file>
+args: <action.args or "">
+read_sections: <action.read_sections joined by ", ">
+write_section: <action.write_section>
+result_format: <action.result_format>
+""")
+  for action in descriptor["actions"]
+]
+```
+
+Log each result:
+```
+[<work-item-id>] <action.skill>: <result>
+```
+
+Then continue the loop.
 
 **If `action == "spawn_agent"` (any other skill):**
 
@@ -138,6 +166,10 @@ The task-runner returns exactly one line (the result indicator). Log it:
 ```
 
 Then continue the loop.
+
+> **Note:** Once a pull request exists, build and test validation is performed by
+> GitHub Actions on the PR branch. The pipeline reads failing check output from
+> `gh pr checks <pr_url>` rather than running validate scripts in-process.
 
 ### 3 — Error handling
 
