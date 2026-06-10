@@ -119,36 +119,36 @@ class TestComputeContextPath:
 # ---------------------------------------------------------------------------
 
 class TestSignoffCycleCount:
-    def _make_ctx(self, **kwargs):
+    def make_sut(self, **kwargs):
         from dev_team import PipelineContext
         return PipelineContext(work_item_id="ADR-TEST", **kwargs)
 
     def test_starts_at_zero(self):
-        ctx = self._make_ctx()
+        ctx = self.make_sut()
         assert ctx.signoff_cycle_count == 0
 
     def test_increments_on_signoff_changes_requested(self):
         from dev_team import _apply_counter_updates
-        ctx = self._make_ctx()
+        ctx = self.make_sut()
         _apply_counter_updates(ctx, "signoff", "changes_requested")
         assert ctx.signoff_cycle_count == 1
 
     def test_accumulates_across_multiple_cycles(self):
         from dev_team import _apply_counter_updates
-        ctx = self._make_ctx()
+        ctx = self.make_sut()
         _apply_counter_updates(ctx, "signoff", "changes_requested")
         _apply_counter_updates(ctx, "signoff", "changes_requested")
         assert ctx.signoff_cycle_count == 2
 
     def test_resets_to_zero_on_signoff_approved(self):
         from dev_team import _apply_counter_updates
-        ctx = self._make_ctx(signoff_cycle_count=3)
+        ctx = self.make_sut(signoff_cycle_count=3)
         _apply_counter_updates(ctx, "signoff", "approved")
         assert ctx.signoff_cycle_count == 0
 
     def test_not_affected_by_reviewing_step(self):
         from dev_team import _apply_counter_updates
-        ctx = self._make_ctx(signoff_cycle_count=1)
+        ctx = self.make_sut(signoff_cycle_count=1)
         _apply_counter_updates(ctx, "reviewing", "changes_requested")
         assert ctx.signoff_cycle_count == 1
 
@@ -166,35 +166,35 @@ class TestSignoffCycleCount:
 # ---------------------------------------------------------------------------
 
 class TestReviewCycleCount:
-    def _make_ctx(self, **kwargs):
+    def make_sut(self, **kwargs):
         from dev_team import PipelineContext
         return PipelineContext(work_item_id="ADR-TEST", **kwargs)
 
     def test_starts_at_zero(self):
-        ctx = self._make_ctx()
+        ctx = self.make_sut()
         assert ctx.review_cycle_count == 0
 
     def test_increments_on_reviewing_step_changes_requested(self):
         from dev_team import _apply_counter_updates
-        ctx = self._make_ctx()
+        ctx = self.make_sut()
         _apply_counter_updates(ctx, "reviewing", "changes_requested")
         assert ctx.review_cycle_count == 1
 
     def test_increments_on_reviewing_step_approved(self):
         from dev_team import _apply_counter_updates
-        ctx = self._make_ctx()
+        ctx = self.make_sut()
         _apply_counter_updates(ctx, "reviewing", "approved")
         assert ctx.review_cycle_count == 1
 
     def test_resets_to_zero_on_signoff_approved(self):
         from dev_team import _apply_counter_updates
-        ctx = self._make_ctx(review_cycle_count=3)
+        ctx = self.make_sut(review_cycle_count=3)
         _apply_counter_updates(ctx, "signoff", "approved")
         assert ctx.review_cycle_count == 0
 
     def test_not_affected_by_signoff_changes_requested(self):
         from dev_team import _apply_counter_updates
-        ctx = self._make_ctx(review_cycle_count=1)
+        ctx = self.make_sut(review_cycle_count=1)
         _apply_counter_updates(ctx, "signoff", "changes_requested")
         assert ctx.review_cycle_count == 1
 
@@ -212,23 +212,23 @@ class TestReviewCycleCount:
 # ---------------------------------------------------------------------------
 
 class TestConsecutiveFailures:
-    def _make_ctx(self, **kwargs):
+    def make_sut(self, **kwargs):
         from dev_team import PipelineContext
         return PipelineContext(work_item_id="ADR-TEST", **kwargs)
 
     def test_starts_at_zero(self):
-        ctx = self._make_ctx()
+        ctx = self.make_sut()
         assert ctx.consecutive_failures == 0
 
     def test_increments_on_agent_failure(self):
         from dev_team import _handle_agent_failure
-        ctx = self._make_ctx()
+        ctx = self.make_sut()
         _handle_agent_failure(ctx)
         assert ctx.consecutive_failures == 1
 
     def test_accumulates_across_multiple_failures(self):
         from dev_team import _handle_agent_failure
-        ctx = self._make_ctx()
+        ctx = self.make_sut()
         _handle_agent_failure(ctx)
         _handle_agent_failure(ctx)
         _handle_agent_failure(ctx)
@@ -236,13 +236,13 @@ class TestConsecutiveFailures:
 
     def test_resets_to_zero_on_agent_success(self):
         from dev_team import _handle_agent_success
-        ctx = self._make_ctx(consecutive_failures=5)
+        ctx = self.make_sut(consecutive_failures=5)
         _handle_agent_success(ctx)
         assert ctx.consecutive_failures == 0
 
     def test_reset_does_not_require_prior_failure(self):
         from dev_team import _handle_agent_success
-        ctx = self._make_ctx(consecutive_failures=0)
+        ctx = self.make_sut(consecutive_failures=0)
         _handle_agent_success(ctx)
         assert ctx.consecutive_failures == 0
 
