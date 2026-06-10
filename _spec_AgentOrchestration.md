@@ -569,7 +569,44 @@ All three components needed to reach a runnable state. `dev_team.py` exits with 
 
 ---
 
-### Task 2: Environment setup 🧑 (ADR-274)
+### Task 2: Step protocol refactor — `get_actions` / `handle_results` / `ParallelSteps` 🤖
+
+_Depends on Task 1. Refactor only — no behaviour changes visible to the pipeline._
+
+Introduce a clean two-method `Step` protocol that replaces the current `execute()`/`exit_with_actions()` pattern. Every step expresses what it wants to do (`get_actions`) and how it interprets the outcome (`handle_results`). Parallelism is expressed through a generic `ParallelSteps` composite rather than bespoke coordination logic inside individual steps.
+
+**`Step` base class:**
+- [ ] `get_actions(self) -> list[dict]` — returns a list of action descriptors (`spawn_agent` or `run_script` items); replaces direct calls to `exit_with_actions()`
+- [ ] `handle_results(self, results: list[str]) -> str` — accepts the ordered list of one-line result strings (one per action from the previous `get_actions` call) and returns a branch moniker (e.g., `"approved"`, `"changes_requested"`, `"implemented"`)
+- [ ] Steps no longer call `exit_with_actions()` directly; the state machine owns the exit
+
+**State machine loop in `dev_team.py`:**
+- [ ] Script invoked **with** `--results <comma-separated>`: parse results → `current_step.handle_results(results)` → get branch moniker → transition to next step → `next_step.get_actions()` → `exit_with_actions(actions)`
+- [ ] Script invoked **without** `--results` (recovery / initial run): `current_step.get_actions()` → `exit_with_actions(actions)`
+- [ ] If `get_actions()` returns `[]` (inline step): immediately call `handle_results([])` → transition → call `get_actions()` on next step → continue; guard against infinite inline loop (raise if step pointer does not advance)
+- [ ] `dev-team.md` updated to collect all one-line results from parallel agents/scripts and pass them as `--results "r1,r2,r3"` on the next script invocation
+
+**`ParallelSteps` composite:**
+- [ ] `__init__(self, steps: list[Step])` — holds ordered list of child steps
+- [ ] `get_actions()` — calls `get_actions()` on each child and returns the concatenated flat list; records how many actions each child contributed (for result distribution)
+- [ ] `handle_results(results)` — splits the flat result list by child action counts; calls `handle_results` on each child; passes all child branch monikers to `combine_results()`
+- [ ] `combine_results(self, child_monikers: list[str]) -> str` — default implementation: `"failed"` if any child returned `"failed"`; `"changes_requested"` if any returned `"changes_requested"`; otherwise the first moniker (assumes homogeneous success values). Subclasses may override.
+
+**Refactor `SignOffStep`:**
+- [ ] Decompose into `ReviewerSignOffStep`, `ResearcherSignOffStep`, and `BuildValidationStep` — each a simple single-action step
+- [ ] `SignOffStep` becomes a `ParallelSteps` wrapping these three (or the applicable subset per workflow), with `combine_results` using the precedence rule above
+- [ ] All sign-off-specific parallel coordination logic removed from the old `SignOffStep`
+
+**Tests:**
+- [ ] Unit tests for `ParallelSteps.get_actions()` — flat list is correct concatenation of children
+- [ ] Unit tests for `ParallelSteps.handle_results()` — results distributed correctly by action count; `combine_results` precedence verified
+- [ ] Unit tests for inline step (empty `get_actions`) — state machine advances without exiting; infinite-loop guard fires on non-advancing step
+- [ ] Unit tests for `--results` parsing and absence (recovery path)
+- [ ] Given an existing workflow, when the refactored state machine runs end-to-end in tests, then it produces the same sequence of exits as the pre-refactor code
+
+---
+
+### Task 3: Environment setup 🧑 (ADR-274)
 
 One-time operator configuration required before the pipeline can run. No code changes.
 
@@ -580,9 +617,9 @@ One-time operator configuration required before the pipeline can run. No code ch
 
 ---
 
-### Task 3: End-to-end pipeline validation 🤖 (ADR-275)
+### Task 4: End-to-end pipeline validation 🤖 (ADR-275)
 
-_Depends on Tasks 1 and 2._
+_Depends on Tasks 1, 2, and 3._
 
 Run a full implement pipeline cycle to confirm the step-machine architecture works end-to-end.
 
@@ -593,7 +630,7 @@ Run a full implement pipeline cycle to confirm the step-machine architecture wor
 
 ---
 
-### Task 4: Troubleshooter agent 🤖 (ADR-276)
+### Task 5: Troubleshooter agent 🤖 (ADR-276)
 
 _Can run after Task 3 or in parallel. The pipeline is fully functional without it._
 
