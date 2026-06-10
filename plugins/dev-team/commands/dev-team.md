@@ -54,33 +54,35 @@ python -u ${CLAUDE_PLUGIN_ROOT}/scripts/dev_team.py <work-item-id> \
   --context-file <context_file>
 ```
 
-Capture all stdout. The last JSON object on stdout is the action descriptor.
+Capture all stdout. The last JSON array on stdout is the action descriptor list.
 
-#### 2b — Parse the descriptor
+#### 2b — Parse the descriptor array
 
 Display any non-JSON stdout lines as status updates to the user.
 
-Extract the last line from stdout that is a valid JSON object.
+Extract the last line from stdout that is a valid JSON array (starts with `[`).
 
-If the descriptor contains a `"message"` field, display it to the user before
-spawning the next agent.
+If the descriptors contain any `"message"` fields, use them to describe to the user
+what work is being done before spawning the next agents.
 
 #### 2c — Branch on action
 
-**If `action == "done"`:**
+Let `descriptors` be the parsed JSON array. The array always has at least one item.
+
+**If `descriptors` is a single-item array and `descriptors[0].action == "done"`:**
 - If `result == "success"`: report success to the user and stop.
 - If `result == "failed"`: report the failure reason to the user and stop.
 
-**If `action == "spawn_agent"` and `skill == "troubleshooter"`:**
+**If `descriptors` is a single-item array and `descriptors[0].skill == "troubleshooter"`:**
 
 Spawn the troubleshooter agent:
 ```
 Agent(
   subagent_type="troubleshooter",
   prompt="""
-context_file: <descriptor.context_file>
-trigger: <descriptor.trigger>
-cycle_count: <descriptor.cycle_count>
+context_file: <descriptors[0].context_file>
+trigger: <descriptors[0].trigger>
+cycle_count: <descriptors[0].cycle_count>
 """
 )
 ```
@@ -106,53 +108,86 @@ Handle the outcome (a JSON object with `action` field):
      ```
   3. Continue the loop
 
-**If `action == "spawn_agent"` and descriptor contains an `"actions"` list:**
-
-Spawn all agents in parallel using multiple `Agent(...)` calls and await all results:
-
-```
-results = await [
-  Agent(subagent_type="task-runner", prompt="""
-agent: <action.agent>
-skill: <action.skill>
-context_file: <action.context_file>
-args: <action.args or "">
-read_sections: <action.read_sections joined by ", ">
-write_section: <action.write_section>
-result_format: <action.result_format>
-""")
-  for action in descriptor["actions"]
-]
-```
-
-Log each result:
-```
-[<work-item-id>] <action.skill>: <result>
-```
-
-Then continue the loop.
-
-**If `action == "spawn_agent"` (any other skill):**
+**If `descriptors` is a single-item array and `descriptors[0].action == "spawn_agent"`:**
 
 Spawn the task-runner agent:
 ```
 Agent(
   subagent_type="task-runner",
   prompt="""
-agent: <descriptor.agent>
-skill: <descriptor.skill>
-context_file: <descriptor.context_file>
-args: <descriptor.args or "">
-read_sections: <descriptor.read_sections joined by ", ">
-write_section: <descriptor.write_section>
-result_format: <descriptor.result_format>
+agent: <descriptors[0].agent>
+skill: <descriptors[0].skill>
+context_file: <descriptors[0].context_file>
+args: <descriptors[0].args or "">
+read_sections: <descriptors[0].read_sections joined by ", ">
+write_section: <descriptors[0].write_section>
+result_format: <descriptors[0].result_format>
 """
 )
 ```
 
+Display any `message` field from the descriptor to the user before spawning.
+
 The task-runner returns exactly one line (the result indicator). Log it:
 ```
 [<work-item-id>] <skill>: <result>
+```
+
+Then continue the loop.
+
+**All other lists (multiple items or a single `run_script` item):**
+
+Dispatch all items in parallel — `spawn_agent` items via `Agent(subagent_type="task-runner")`,
+`run_script` items via `Agent(subagent_type="script-runner")`:
+
+```
+results = await [
+  Agent(subagent_type="task-runner", prompt="""
+agent: <item.agent>
+skill: <item.skill>
+context_file: <item.context_file>
+args: <item.args or "">
+read_sections: <item.read_sections joined by ", ">
+write_section: <item.write_section>
+result_format: <item.result_format>
+""")  if item.action == "spawn_agent"  else
+
+  Agent(subagent_type="script-runner", prompt="""
+command: <item.command>
+log_file: <item.log_file>
+result_format: <item.result_format>
+""")  if item.action == "run_script"
+
+  for item in descriptors
+]
+```
+
+Log each result:
+```
+[<work-item-id>] <item.skill or item.command>: <result>
+```
+
+For each `run_script` item that has a `write_section` field, write the one-line result
+to that section in the context file:
+```bash
+python -c "
+from pathlib import Path; import sys
+path = Path('<context_file>')
+result = '<result_line>'   # e.g. 'passed' or 'failed'
+section = '<item.write_section>'
+sentinel = f'<!-- section:{section} -->'
+text = path.read_text(encoding='utf-8')
+if sentinel in text:
+    import re
+    text = re.sub(
+        sentinel + r'.*?(?=<!-- section:|$)',
+        sentinel + '\n\n' + result + '\n',
+        text, flags=re.DOTALL
+    )
+else:
+    text += f'\n{sentinel}\n\n{result}\n'
+path.write_text(text, encoding='utf-8')
+"
 ```
 
 Then continue the loop.

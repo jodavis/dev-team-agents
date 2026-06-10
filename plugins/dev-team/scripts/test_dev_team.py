@@ -1,10 +1,11 @@
 """Tests for core step-machine components of dev_team.py.
 
 Covers:
-- exit_with_action() — JSON serialisation and exit-code 0
+- exit_with_actions() — JSON array serialisation and exit-code 0
 - compute_context_path() — base path resolution with/without DEV_TEAM_STATE_DIR
 - Counter increment/reset logic — signoff_cycle_count, consecutive_failures,
   review_cycle_count
+- signoff_build_result field — save/load round-trip
 """
 
 import json
@@ -21,13 +22,13 @@ SCRIPTS_DIR = Path(__file__).parent
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _run_exit_with_action(descriptor: dict) -> subprocess.CompletedProcess:
-    """Invoke exit_with_action in a child process to isolate sys.exit."""
-    descriptor_json = json.dumps(descriptor)
+def _run_exit_with_actions(descriptors: list[dict]) -> subprocess.CompletedProcess:
+    """Invoke exit_with_actions in a child process to isolate sys.exit."""
+    descriptors_json = json.dumps(descriptors)
     script = (
         f"import sys; sys.path.insert(0, {str(SCRIPTS_DIR)!r}); "
-        f"import json; from dev_team import exit_with_action; "
-        f"exit_with_action(json.loads({descriptor_json!r}))"
+        f"import json; from dev_team import exit_with_actions; "
+        f"exit_with_actions(json.loads({descriptors_json!r}))"
     )
     return subprocess.run(
         [sys.executable, "-c", script],
@@ -38,19 +39,25 @@ def _run_exit_with_action(descriptor: dict) -> subprocess.CompletedProcess:
 
 
 # ---------------------------------------------------------------------------
-# exit_with_action
+# exit_with_actions
 # ---------------------------------------------------------------------------
 
-class TestExitWithAction:
+class TestExitWithActions:
     def test_exits_with_code_0(self):
-        result = _run_exit_with_action({"action": "done", "result": "success"})
+        result = _run_exit_with_actions([{"action": "done", "result": "success"}])
         assert result.returncode == 0
 
-    def test_emits_json_on_stdout(self):
+    def test_emits_json_array_on_stdout(self):
         descriptor = {"action": "done", "result": "success", "reason": "all clean"}
-        result = _run_exit_with_action(descriptor)
+        result = _run_exit_with_actions([descriptor])
         parsed = json.loads(result.stdout.strip())
-        assert parsed == descriptor
+        assert isinstance(parsed, list)
+        assert parsed == [descriptor]
+
+    def test_single_item_wrapped_in_array(self):
+        result = _run_exit_with_actions([{"action": "done"}])
+        parsed = json.loads(result.stdout.strip())
+        assert parsed == [{"action": "done"}]
 
     def test_serializes_nested_list_fields(self):
         descriptor = {
@@ -62,18 +69,29 @@ class TestExitWithAction:
             "write_section": "Implementation Summary",
             "result_format": "implemented | failed | needs_clarification",
         }
-        result = _run_exit_with_action(descriptor)
+        result = _run_exit_with_actions([descriptor])
         assert result.returncode == 0
-        assert json.loads(result.stdout.strip()) == descriptor
+        parsed = json.loads(result.stdout.strip())
+        assert parsed == [descriptor]
 
     def test_nothing_on_stderr(self):
-        result = _run_exit_with_action({"action": "done", "result": "success"})
+        result = _run_exit_with_actions([{"action": "done", "result": "success"}])
         assert result.stderr == ""
 
-    def test_empty_descriptor_is_valid(self):
-        result = _run_exit_with_action({})
+    def test_empty_list_is_valid(self):
+        result = _run_exit_with_actions([])
         assert result.returncode == 0
-        assert json.loads(result.stdout.strip()) == {}
+        assert json.loads(result.stdout.strip()) == []
+
+    def test_multiple_items_preserved_in_order(self):
+        items = [
+            {"action": "spawn_agent", "skill": "reviewer-sign-off"},
+            {"action": "spawn_agent", "skill": "researcher-validate"},
+            {"action": "run_script", "command": "bash build.sh"},
+        ]
+        result = _run_exit_with_actions(items)
+        parsed = json.loads(result.stdout.strip())
+        assert parsed == items
 
 
 # ---------------------------------------------------------------------------
@@ -379,56 +397,123 @@ class TestPrintContextPath:
 
 
 # ---------------------------------------------------------------------------
-# exit_with_action supports "actions" list (parallel descriptor)
+# exit_with_actions — parallel flat array with mixed spawn_agent + run_script
 # ---------------------------------------------------------------------------
 
-class TestExitWithActionParallel:
-    def test_serializes_actions_list(self):
-        descriptor = {
-            "action": "spawn_agent",
-            "message": "Running in parallel.",
-            "actions": [
-                {"agent": "reviewer", "skill": "reviewer-sign-off",
-                 "context_file": "/tmp/ctx.md", "read_sections": [],
-                 "write_section": "Signoff Review", "result_format": "approved | changes_requested"},
-                {"agent": "researcher", "skill": "researcher-validate",
-                 "context_file": "/tmp/ctx.md", "read_sections": ["Researcher Brief"],
-                 "write_section": "Signoff Research", "result_format": "validated | failed"},
-            ],
-        }
-        result = _run_exit_with_action(descriptor)
+class TestExitWithActionsParallel:
+    def test_flat_array_with_spawn_and_run_script_items(self):
+        items = [
+            {"action": "spawn_agent", "agent": "task-runner", "skill": "reviewer-sign-off",
+             "context_file": "/tmp/ctx.md", "read_sections": [],
+             "write_section": "Signoff Review", "result_format": "approved | changes_requested"},
+            {"action": "spawn_agent", "agent": "task-runner", "skill": "researcher-validate",
+             "context_file": "/tmp/ctx.md", "read_sections": ["Researcher Brief"],
+             "write_section": "Signoff Research", "result_format": "validated | failed"},
+            {"action": "run_script", "command": "bash validate-build.sh",
+             "log_file": "/tmp/signoff.log", "result_format": "passed | failed"},
+        ]
+        result = _run_exit_with_actions(items)
         assert result.returncode == 0
         parsed = json.loads(result.stdout.strip())
-        assert parsed["action"] == "spawn_agent"
-        assert len(parsed["actions"]) == 2
-        assert parsed["actions"][0]["skill"] == "reviewer-sign-off"
-        assert parsed["actions"][1]["skill"] == "researcher-validate"
+        assert isinstance(parsed, list)
+        assert len(parsed) == 3
+
+    def test_reviewer_item_in_flat_array(self):
+        items = [
+            {"action": "spawn_agent", "skill": "reviewer-sign-off"},
+            {"action": "spawn_agent", "skill": "researcher-validate"},
+            {"action": "run_script", "command": "bash build.sh", "log_file": "/tmp/build.log",
+             "result_format": "passed | failed"},
+        ]
+        result = _run_exit_with_actions(items)
+        parsed = json.loads(result.stdout.strip())
+        assert parsed[0]["skill"] == "reviewer-sign-off"
+
+    def test_run_script_item_has_correct_fields(self):
+        run_item = {"action": "run_script", "command": "bash test.sh",
+                    "log_file": "/tmp/test.log", "result_format": "passed | failed"}
+        result = _run_exit_with_actions([run_item])
+        parsed = json.loads(result.stdout.strip())
+        assert parsed[0]["action"] == "run_script"
+        assert parsed[0]["command"] == "bash test.sh"
+        assert parsed[0]["log_file"] == "/tmp/test.log"
 
 
 # ---------------------------------------------------------------------------
-# message field in exit_with_action descriptors
+# message field in exit_with_actions items
 # ---------------------------------------------------------------------------
 
-class TestExitWithActionMessage:
-    def test_message_field_is_serialized(self):
-        descriptor = {
+class TestExitWithActionsMessage:
+    def test_message_field_in_item_is_serialized(self):
+        item = {
             "action": "spawn_agent",
             "message": "Developer is implementing.",
             "agent": "developer",
             "skill": "developer-implement",
         }
-        result = _run_exit_with_action(descriptor)
+        result = _run_exit_with_actions([item])
         assert result.returncode == 0
         parsed = json.loads(result.stdout.strip())
-        assert parsed["message"] == "Developer is implementing."
+        assert parsed[0]["message"] == "Developer is implementing."
 
-    def test_descriptor_without_message_still_valid(self):
-        """Backward-compat: descriptors without 'message' still work."""
-        descriptor = {"action": "done", "result": "success"}
-        result = _run_exit_with_action(descriptor)
+    def test_item_without_message_still_valid(self):
+        item = {"action": "done", "result": "success"}
+        result = _run_exit_with_actions([item])
         assert result.returncode == 0
         parsed = json.loads(result.stdout.strip())
-        assert "message" not in parsed
+        assert "message" not in parsed[0]
+
+
+# ---------------------------------------------------------------------------
+# signoff_build_result field
+# ---------------------------------------------------------------------------
+
+class TestSignoffBuildResult:
+    def make_sut(self, **kwargs):
+        from dev_team import PipelineContext
+        return PipelineContext(work_item_id="ADR-TEST", **kwargs)
+
+    def test_defaults_to_empty_string(self):
+        ctx = self.make_sut()
+        assert ctx.signoff_build_result == ""
+
+    def test_roundtrip_through_save_load(self, tmp_path):
+        from dev_team import PipelineContext
+        ctx = PipelineContext(work_item_id="ADR-123", signoff_build_result="passed")
+        path = tmp_path / "ctx.md"
+        ctx.save(path)
+        loaded = PipelineContext.load(path)
+        assert loaded.signoff_build_result == "passed"
+
+    def test_failed_result_roundtrip(self, tmp_path):
+        from dev_team import PipelineContext
+        ctx = PipelineContext(work_item_id="ADR-123", signoff_build_result="failed")
+        path = tmp_path / "ctx.md"
+        ctx.save(path)
+        loaded = PipelineContext.load(path)
+        assert loaded.signoff_build_result == "failed"
+
+    def test_empty_string_roundtrip(self, tmp_path):
+        from dev_team import PipelineContext
+        ctx = PipelineContext(work_item_id="ADR-123", signoff_build_result="")
+        path = tmp_path / "ctx.md"
+        ctx.save(path)
+        loaded = PipelineContext.load(path)
+        assert loaded.signoff_build_result == ""
+
+    def test_reset_alongside_signoff_sections(self):
+        """signoff_build_result can be reset to empty alongside signoff_review/research."""
+        ctx = self.make_sut(
+            signoff_review="approved",
+            signoff_research="validated",
+            signoff_build_result="passed",
+        )
+        ctx.signoff_review = ""
+        ctx.signoff_research = ""
+        ctx.signoff_build_result = ""
+        assert ctx.signoff_build_result == ""
+        assert ctx.signoff_review == ""
+        assert ctx.signoff_research == ""
 
 
 # ---------------------------------------------------------------------------
