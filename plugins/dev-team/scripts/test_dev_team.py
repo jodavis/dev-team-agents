@@ -479,19 +479,32 @@ class TestSignoffBuildResult:
 
     def test_roundtrip_through_save_load(self, tmp_path):
         from dev_team import PipelineContext
-        ctx = PipelineContext(work_item_id="ADR-123", signoff_build_result="passed")
+        # script-runner returns "passed — log: <path>", not bare "passed"
+        result = "passed — log: /home/user/.dev-team/ADR-123/logs/ADR-123-signoff-20240101T120000.log"
+        ctx = PipelineContext(work_item_id="ADR-123", signoff_build_result=result)
         path = tmp_path / "ctx.md"
         ctx.save(path)
         loaded = PipelineContext.load(path)
-        assert loaded.signoff_build_result == "passed"
+        assert loaded.signoff_build_result == result
 
     def test_failed_result_roundtrip(self, tmp_path):
         from dev_team import PipelineContext
-        ctx = PipelineContext(work_item_id="ADR-123", signoff_build_result="failed")
+        result = "failed — log: /home/user/.dev-team/ADR-123/logs/ADR-123-signoff-20240101T120000.log"
+        ctx = PipelineContext(work_item_id="ADR-123", signoff_build_result=result)
         path = tmp_path / "ctx.md"
         ctx.save(path)
         loaded = PipelineContext.load(path)
-        assert loaded.signoff_build_result == "failed"
+        assert loaded.signoff_build_result == result
+
+    def test_passed_with_log_path_is_recognized(self):
+        """script-runner returns 'passed — log: <path>'; startswith check must succeed."""
+        result = "passed — log: /home/user/.dev-team/ADR-123/logs/ADR-123-signoff-20240101T120000.log"
+        assert result.strip().startswith("passed")
+
+    def test_failed_with_log_path_is_not_passed(self):
+        """script-runner returns 'failed — log: <path>'; must not satisfy the passed check."""
+        result = "failed — log: /home/user/.dev-team/ADR-123/logs/ADR-123-signoff-20240101T120000.log"
+        assert not result.strip().startswith("passed")
 
     def test_empty_string_roundtrip(self, tmp_path):
         from dev_team import PipelineContext
@@ -506,7 +519,7 @@ class TestSignoffBuildResult:
         ctx = self.make_sut(
             signoff_review="approved",
             signoff_research="validated",
-            signoff_build_result="passed",
+            signoff_build_result="passed — log: /tmp/test.log",
         )
         ctx.signoff_review = ""
         ctx.signoff_research = ""

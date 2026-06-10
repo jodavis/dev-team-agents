@@ -896,7 +896,7 @@ class SignoffStep(Step):
         # All three results available — process them
         failures: list[str] = []
 
-        build_passed = ctx.signoff_build_result.strip() == "passed"
+        build_passed = ctx.signoff_build_result.strip().startswith("passed")
         if not build_passed:
             failures.append(
                 f"Build/test validation failed. Log: {ctx.build_log}\n"
