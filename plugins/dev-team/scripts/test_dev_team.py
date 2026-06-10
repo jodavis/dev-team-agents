@@ -283,3 +283,59 @@ class TestTroubleshooterInput:
         ctx.save(path)
         loaded = PipelineContext.load(path)
         assert loaded.troubleshooter_input == ""
+
+
+# ---------------------------------------------------------------------------
+# _researcher_validated
+# ---------------------------------------------------------------------------
+
+class TestResearcherValidated:
+    def test_validated_indicator_returns_true(self):
+        from dev_team import _researcher_validated
+        assert _researcher_validated("validated") is True
+
+    def test_failed_indicator_returns_false(self):
+        from dev_team import _researcher_validated
+        assert _researcher_validated("failed") is False
+
+    def test_validated_with_whitespace_returns_true(self):
+        from dev_team import _researcher_validated
+        assert _researcher_validated("  validated\n") is True
+
+    def test_failed_with_whitespace_returns_false(self):
+        from dev_team import _researcher_validated
+        assert _researcher_validated("  failed\n") is False
+
+    def test_json_array_all_pass_returns_true(self):
+        from dev_team import _researcher_validated
+        content = '[{"status": "pass", "criterion": "Tests pass"}]'
+        assert _researcher_validated(content) is True
+
+    def test_json_array_with_fail_returns_false(self):
+        from dev_team import _researcher_validated
+        content = '[{"status": "fail", "criterion": "Tests pass"}]'
+        assert _researcher_validated(content) is False
+
+    def test_json_array_with_partial_returns_false(self):
+        from dev_team import _researcher_validated
+        content = '[{"status": "partial", "criterion": "Tests pass"}]'
+        assert _researcher_validated(content) is False
+
+    def test_json_array_in_fenced_block_with_fail(self):
+        from dev_team import _researcher_validated
+        content = '```json\n[{"status": "fail", "criterion": "x"}]\n```'
+        assert _researcher_validated(content) is False
+
+    def test_description_containing_never_failed_is_not_false_positive(self):
+        from dev_team import _researcher_validated
+        # "failed" substring in a description must not cause a false-positive
+        content = '[{"status": "pass", "criterion": "Tests never failed"}]'
+        assert _researcher_validated(content) is True
+
+    def test_unrecognised_content_returns_false(self):
+        from dev_team import _researcher_validated
+        assert _researcher_validated("some unexpected output") is False
+
+    def test_empty_string_returns_false(self):
+        from dev_team import _researcher_validated
+        assert _researcher_validated("") is False

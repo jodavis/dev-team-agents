@@ -392,6 +392,31 @@ def parse_json_output(text: str) -> dict:
     return {}
 
 
+def _researcher_validated(content: str) -> bool:
+    """Return True if researcher-validate reported success.
+
+    The task-runner writes the one-line result indicator from result_format
+    ("validated" | "failed") to the Signoff Research section.  Fall back to
+    JSON-array parsing for output written by older skill versions.
+    """
+    text = content.strip()
+    if text == "validated":
+        return True
+    if text == "failed":
+        return False
+    # Legacy / raw skill output: look for a JSON array with fail/partial items.
+    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+    candidate = fenced.group(1).strip() if fenced else text
+    try:
+        data = json.loads(candidate)
+        if isinstance(data, list):
+            return not any(item.get("status") in ("fail", "partial") for item in data)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    # Unrecognised format — treat as not validated so signoff retries.
+    return False
+
+
 def _troubleshooter_descriptor(
     trigger: str, context_path: Path, ctx: "PipelineContext"
 ) -> dict:
@@ -777,9 +802,8 @@ class SignoffStep(Step):
             failures.append(f"Reviewer sign-off:\n{ctx.signoff_review}")
 
         # Process researcher validate result
-        researcher_ok = True
-        if ctx.signoff_research and "failed" in ctx.signoff_research.lower():
-            researcher_ok = False
+        researcher_ok = _researcher_validated(ctx.signoff_research)
+        if not researcher_ok:
             failures.append(f"Research validation:\n{ctx.signoff_research}")
 
         # Reset sub-step sections for the next signoff cycle
