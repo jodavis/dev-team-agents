@@ -1,7 +1,15 @@
 ---
-description: Start a dev-team pipeline script for a resolved work item and stream its output. Called by implement and fix after argument parsing.
+description: "DEPRECATED — replaced by dev-team.md. Invokes the step-machine orchestration loop instead."
 argument-hint: <work-item-id> <workflow> <research-skill>
 user-invocable: false
+deprecated: true
+---
+
+> **Deprecated.** This skill is replaced by `dev-team.md`. Invoke the `dev-team` skill
+> instead. `implement.md` and `fix.md` already call `dev-team` directly.
+>
+> This file is retained for reference only and will be removed in a future release.
+
 ---
 
 ## Arguments

@@ -45,19 +45,48 @@ connectors. Sub-agents spawned by the top-level Claude Code session via the `Age
 inherit full credentials. The current architecture (script as sole orchestrator) therefore
 cannot give sub-agents direct MCP access.
 
-_Decision:_ `dev_team.py` becomes a step machine. It runs all deterministic operations
-(build, test, git, state transitions) directly, then **exits** with a structured JSON
-descriptor on stdout when an agent needs to run. `dev-team.md` drives a loop: invoke the
-script, parse the descriptor, spawn the named agent via the `Agent` tool, then re-invoke
-the script. The top-level agent's own context accumulates only the compact one-line result
-returned by each agent — never the agent's full working output, which goes to the context
-file.
+_Decision:_ `dev_team.py` becomes a step machine. It runs git and state-transition
+operations directly, then **exits** with a structured JSON descriptor list on stdout when
+agents need to run or scripts need to execute. `dev-team.md` drives a loop: invoke the
+script, parse the descriptor list, dispatch all items in parallel via the `Agent` tool
+(for agent items) or `Bash` via a `script-runner` agent (for script items), collect
+results, then re-invoke the script. The top-level agent's own context accumulates only
+the compact one-line results returned by each agent — never full working output, which
+goes to the context file.
 
 _Consequences:_ `dev_team.py` loses its subprocess-spawn loop and monitoring logic.
 `dev-team.md` gains a tight orchestration loop. Sub-agents gain full MCP access. The
 ADR-246 scrum-master relay milestones are removed; agents post to Jira and GitHub
 directly. The pipeline cannot run without an active Claude Code session driving it
 (acceptable — the pipeline was always interactive).
+
+---
+
+### Parallel dispatch: descriptor list and script-runner agent
+
+_Context:_ Some pipeline steps are naturally parallel — the sign-off step previously ran
+researcher-signoff, reviewer-signoff, and build/test validation concurrently.
+Serialising these into sequential `exit_with_actions` calls requires complicated
+pause-and-resume logic inside `SignOffStep` and is slower. Additionally, deterministic
+script runs (build, test) previously executed inside `dev_team.py`, making them
+invisible to the top-level agent and preventing any user-visible progress reporting.
+
+_Decision:_ The exit descriptor becomes a **list**. Each item is either `spawn_agent`
+(existing) or the new `run_script` type. `dev-team.md` spawns all items in the list in
+parallel. For `run_script` items, it spawns a named `script-runner` agent whose sole job
+is: run the command, write full output to a log file at
+`~/.dev-team/<repo-slug>/logs/`, and return `passed | failed`. The top-level agent
+receives a compact one-line result from each item and knows what is happening at each step.
+
+`script-runner` is a **separate agent from `task-runner`**: `task-runner` orchestrates
+skill invocations against the context file; `script-runner` executes shell commands and
+captures their output to a log. Keeping them separate avoids conditional logic in each
+and keeps both files small.
+
+_Consequences:_ `SignOffStep` can express its natural parallelism in the descriptor list
+without internal coordination logic. Build/test output stays out of the top-level
+context (it goes to a log file). The top-level agent gains visibility into what is
+running at each step and can narrate progress to the user.
 
 ---
 
@@ -181,32 +210,69 @@ all pipeline file I/O moves to `~/.dev-team/<repo-slug>/`.
 
 #### `dev_team.py` exit descriptor (stdout JSON, exit code 0)
 
+The exit value is always a **JSON array** — even when it contains a single item. This keeps `dev-team.md` parsing uniform.
+
+Single agent step:
 ```json
-{
-  "action": "spawn_agent",
-  "agent": "developer",
-  "skill": "developer-implement",
-  "context_file": "/Users/jodavis/.dev-team/jodavis-AdaptiveRemote/ADR-123.md",
-  "read_sections": ["Researcher Brief", "Review Threads"],
-  "write_section": "Implementation Summary",
-  "result_format": "implemented | failed | needs_clarification"
-}
+[
+  {
+    "action": "spawn_agent",
+    "agent": "developer",
+    "skill": "developer-implement",
+    "context_file": "/Users/jodavis/.dev-team/jodavis-AdaptiveRemote/ADR-123.md",
+    "read_sections": ["Researcher Brief", "Review Threads"],
+    "write_section": "Implementation Summary",
+    "result_format": "implemented | failed | needs_clarification"
+  }
+]
+```
+
+Parallel sign-off step (agents + script run together):
+```json
+[
+  {
+    "action": "spawn_agent",
+    "agent": "task-runner",
+    "skill": "researcher-signoff",
+    "context_file": "/Users/jodavis/.dev-team/jodavis-AdaptiveRemote/ADR-123.md",
+    "read_sections": ["Implementation Summary", "Review Threads"],
+    "write_section": "Signoff Research",
+    "result_format": "approved | changes_requested | failed"
+  },
+  {
+    "action": "spawn_agent",
+    "agent": "task-runner",
+    "skill": "reviewer-signoff",
+    "context_file": "/Users/jodavis/.dev-team/jodavis-AdaptiveRemote/ADR-123.md",
+    "read_sections": ["Implementation Summary", "Review Threads"],
+    "write_section": "Signoff Review",
+    "result_format": "approved | changes_requested | failed"
+  },
+  {
+    "action": "run_script",
+    "command": "dotnet build && dotnet test --no-build",
+    "log_file": "/Users/jodavis/.dev-team/jodavis-AdaptiveRemote/logs/ADR-123-build-20260610T142300.log",
+    "result_format": "passed | failed"
+  }
+]
 ```
 
 For pipeline completion:
 ```json
-{ "action": "done", "result": "success | failed", "reason": "..." }
+[{ "action": "done", "result": "success | failed", "reason": "..." }]
 ```
 
 For troubleshooter:
 ```json
-{
-  "action": "spawn_agent",
-  "skill": "troubleshooter",
-  "context_file": "/Users/jodavis/.dev-team/jodavis-AdaptiveRemote/ADR-123.md",
-  "trigger": "signoff_deadlock",
-  "cycle_count": 2
-}
+[
+  {
+    "action": "spawn_agent",
+    "agent": "troubleshooter",
+    "context_file": "/Users/jodavis/.dev-team/jodavis-AdaptiveRemote/ADR-123.md",
+    "trigger": "signoff_deadlock",
+    "cycle_count": 2
+  }
+]
 ```
 
 #### Task-runner agent prompt (from `dev-team.md` to Agent tool)
@@ -221,6 +287,16 @@ result_format: implemented | failed | needs_clarification
 ```
 
 The task-runner returns **one line**: the chosen `result_format` value.
+
+#### Script-runner agent prompt (from `dev-team.md` to Agent tool)
+
+```
+command: dotnet build && dotnet test --no-build
+log_file: /Users/jodavis/.dev-team/jodavis-AdaptiveRemote/logs/ADR-123-build-20260610T142300.log
+result_format: passed | failed
+```
+
+The script-runner returns **one line**: `passed` or `failed`.
 
 #### Troubleshooter agent prompt
 
@@ -251,10 +327,13 @@ The troubleshooter returns a JSON object:
   fallback computation needed).
 - **Remove:** subprocess-spawn loop, `call_agent()`, `monitor_process()`, and all
   `claude -p` invocations.
-- **Add:** `exit_with_action(descriptor: dict) -> NoReturn` — serialises `descriptor` to
-  JSON, prints to stdout, and calls `sys.exit(0)`.
+- **Add:** `exit_with_actions(descriptors: list[dict]) -> NoReturn` — serialises the list
+  to JSON, prints to stdout, and calls `sys.exit(0)`. Single-item steps still pass a
+  one-element list.
 - **Update:** every location that previously called `call_agent()` now calls
-  `exit_with_action({"action": "spawn_agent", "agent": ..., "skill": ..., ...})`.
+  `exit_with_actions([{"action": "spawn_agent", "agent": ..., "skill": ..., ...}])`.
+- **Update:** parallel steps (e.g. `SignOffStep`) call `exit_with_actions([...])` with
+  multiple items — a mix of `spawn_agent` and `run_script` descriptors as needed.
 - **Add:** troubleshooter trigger conditions (see Troubleshooter section below).
 - **Add:** `consecutive_failures` counter in context file frontmatter, incremented on each
   parse error or empty agent return, reset to 0 on a successful agent return.
@@ -274,9 +353,10 @@ Replace the current "start script, monitor output" pattern with an orchestration
             --research-skill <research-skill>
             --plugin-root ${CLAUDE_PLUGIN_ROOT}
             --context-file <context_file>
-   b. Parse JSON from stdout (last JSON object on stdout)
-   c. If action == "done": report result to user and stop
-   d. If action == "spawn_agent" and skill == "troubleshooter":
+   b. Parse JSON array from stdout
+   c. If the single item has action == "done": report result to user and stop
+   d. If any item has action == "spawn_agent" and agent == "troubleshooter":
+        (troubleshooter is always the sole item in its list)
         Agent(subagent_type="troubleshooter", prompt=<descriptor fields>)
         If outcome.action == "terminate": stop and report to user
         If outcome.action == "needs_user_input":
@@ -284,14 +364,15 @@ Replace the current "start script, monitor output" pattern with an orchestration
           Write answer to `troubleshooter_input` frontmatter key in context file
           Continue loop
         If outcome.action == "continue": continue loop
-   e. If action == "spawn_agent" (any other skill):
-        Agent(subagent_type="task-runner", prompt=<descriptor fields>)
-        (result is one line — log it, then continue loop)
+   e. Otherwise: dispatch all items in the list in parallel —
+        For each spawn_agent item: Agent(subagent_type="task-runner", prompt=<fields>)
+        For each run_script item:  Agent(subagent_type="script-runner", prompt=<fields>)
+        Collect all one-line results; log them; continue loop
    f. Go to step 2
 ```
 
-The loop accumulates only one compact line per iteration (the task-runner's result
-indicator). Context stays lean across an entire pipeline run.
+The loop accumulates only compact one-line results per iteration. Context stays lean
+across an entire pipeline run even when multiple agents and scripts run in parallel.
 
 #### `agents/task-runner.md` (new)
 
@@ -314,6 +395,21 @@ Responsibilities:
 The task-runner must not add commentary, apologies, or explanation to its response. The
 single-line result is the only output the top-level agent receives. `write_section`
 **overwrites** the entire named section — no appending.
+
+#### `agents/script-runner.md` (new)
+
+Named agent. Tools: `Bash`, `Write`.
+
+Responsibilities:
+1. Parse the prompt to extract `command`, `log_file`, `result_format`.
+2. Run `command` via `Bash`, capturing stdout and stderr.
+3. Write the full combined output to `log_file` using `Write`.
+4. Respond with **exactly one line**: `passed` if the command exited 0, `failed` otherwise.
+   The log file path is included: `passed — log: <log_file>` / `failed — log: <log_file>`.
+
+The script-runner must not add commentary or explanation. Its response is one line only.
+
+---
 
 #### `agents/troubleshooter.md` (new)
 
@@ -377,7 +473,7 @@ dev-team.md (top-level, persistent Claude Code session)
   │  ┌─────────────────────────────────────────────────────────┐
   │  │  Loop iteration 1                                       │
   │  │  Bash: python dev_team.py ADR-123 ...                  │
-  │  │  stdout: {"action":"spawn_agent","skill":"researcher-plan",...}
+  │  │  stdout: [{"action":"spawn_agent","skill":"researcher-plan",...}]
   │  │  Agent(subagent_type="task-runner",                     │
   │  │        prompt="skill: researcher-plan ...")             │
   │  │    └─ task-runner reads context, Skill("researcher-plan")
@@ -386,16 +482,31 @@ dev-team.md (top-level, persistent Claude Code session)
   │
   │  ┌─────────────────────────────────────────────────────────┐
   │  │  Loop iteration 2                                       │
-  │  │  Bash: python dev_team.py ...  (script runs build/test) │
-  │  │  stdout: {"action":"spawn_agent","skill":"developer-implement",...}
+  │  │  Bash: python dev_team.py ...                          │
+  │  │  stdout: [{"action":"spawn_agent","skill":"developer-implement",...}]
   │  │  Agent → task-runner → Skill("developer-implement")    │
   │  │  returns "implemented"                                  │
   │  └─────────────────────────────────────────────────────────┘
   │
   │  ┌─────────────────────────────────────────────────────────┐
+  │  │  Loop iteration 3 (sign-off — parallel dispatch)        │
+  │  │  Bash: python dev_team.py ...                          │
+  │  │  stdout: [                                              │
+  │  │    {"action":"spawn_agent","skill":"researcher-signoff"},│
+  │  │    {"action":"spawn_agent","skill":"reviewer-signoff"}, │
+  │  │    {"action":"run_script","command":"dotnet build && dotnet test --no-build",...}
+  │  │  ]                                                      │
+  │  │  ┌─ Agent → task-runner → Skill("researcher-signoff")  │
+  │  │  ├─ Agent → task-runner → Skill("reviewer-signoff")    │
+  │  │  └─ Agent → script-runner → Bash, writes log file      │
+  │  │  (all three in parallel)                               │
+  │  │  Collect: "approved", "approved", "passed — log: ..."  │
+  │  └─────────────────────────────────────────────────────────┘
+  │
+  │  ┌─────────────────────────────────────────────────────────┐
   │  │  Loop iteration N (sign-off deadlock)                   │
   │  │  Bash: python dev_team.py ...                          │
-  │  │  stdout: {"action":"spawn_agent","skill":"troubleshooter",...}
+  │  │  stdout: [{"action":"spawn_agent","agent":"troubleshooter",...}]
   │  │  Agent(subagent_type="troubleshooter", ...)            │
   │  │    └─ reads context, detects deadlock, asks user       │
   │  │       edits context (if continue), returns outcome     │
@@ -415,26 +526,28 @@ _(None — all questions resolved during spec review.)_
 
 ---
 
-### Task 1: Core step-machine — `dev_team.py`, `dev-team.md` loop, and task-runner agent
+### Task 1: Core step-machine — `dev_team.py`, `dev-team.md` loop, and task-runner agent (ADR-273)
 
 All three components needed to reach a runnable state. `dev_team.py` exits with a JSON descriptor; `dev-team.md` drives the loop and spawns agents; the task-runner agent wraps the orchestration protocol. None of the three is independently runnable — they ship together.
 
 **`dev_team.py`:**
 - [ ] `--context-file` CLI argument added; context file written to `~/.dev-team/<repo-slug>/<work-item-id>.md`; log files written to `~/.dev-team/<repo-slug>/logs/`
 - [ ] `DEV_TEAM_STATE_DIR` env var overrides the `~/.dev-team` base path
-- [ ] `exit_with_action(descriptor: dict) -> NoReturn` added; serialises descriptor to JSON on stdout and exits 0
-- [ ] `call_agent()`, `monitor_process()`, and all `claude -p` invocations removed; every call site replaced with `exit_with_action({...})`
+- [ ] `exit_with_actions(descriptors: list[dict]) -> NoReturn` added; serialises list to JSON on stdout and exits 0
+- [ ] `call_agent()`, `monitor_process()`, and all `claude -p` invocations removed; every call site replaced with `exit_with_actions([{...}])`
+- [ ] Parallel steps (e.g. `SignOffStep`) call `exit_with_actions([...])` with multiple items mixing `spawn_agent` and `run_script` descriptors as appropriate
 - [ ] Workflow-file mechanism (`--workflow`, `parse_workflow()`, `WorkflowDefinition`, `StateMachine`) retained unchanged
 - [ ] `PipelineContext` gains frontmatter fields: `signoff_cycle_count`, `consecutive_failures`, `review_cycle_count`, `troubleshooter_input`
-- [ ] Troubleshooter trigger conditions added (see spec table); each routes to `exit_with_action` with the appropriate trigger field
-- [ ] Unit tests written for: `exit_with_action()`, context path computation (with and without `DEV_TEAM_STATE_DIR`), and counter increment/reset logic for all three counters
+- [ ] Troubleshooter trigger conditions added (see spec table); each routes to `exit_with_actions` with the appropriate trigger field
+- [ ] Unit tests written for: `exit_with_actions()`, context path computation (with and without `DEV_TEAM_STATE_DIR`), and counter increment/reset logic for all three counters
 
 **`dev-team.md`:**
 - [ ] Context file path computed from `DEV_TEAM_STATE_DIR` / `~/.dev-team/<repo-slug>/<work-item-id>.md` before the loop starts
 - [ ] Loop invokes `dev_team.py` with `--context-file`, `--workflow`, `--research-skill`, and `--plugin-root`
-- [ ] `action == "done"` branch: reports result to user and stops
-- [ ] `action == "spawn_agent"` (non-troubleshooter) branch: spawns `Agent(subagent_type=<agent>, prompt=<descriptor fields>)`; logs the one-line result
-- [ ] `action == "spawn_agent"` (troubleshooter) branch: spawns troubleshooter agent; handles `continue`, `terminate`, and `needs_user_input` outcomes; writes user answer to `troubleshooter_input` frontmatter key on `needs_user_input`
+- [ ] Parses stdout as a JSON array
+- [ ] `action == "done"` branch (single-item list): reports result to user and stops
+- [ ] Troubleshooter branch (single-item list with `agent == "troubleshooter"`): spawns troubleshooter agent; handles `continue`, `terminate`, and `needs_user_input` outcomes; writes user answer to `troubleshooter_input` frontmatter key on `needs_user_input`
+- [ ] All other lists: dispatches all items in parallel — `spawn_agent` items via `Agent(subagent_type="task-runner")`, `run_script` items via `Agent(subagent_type="script-runner")`; collects and logs all one-line results
 - [ ] `run-workflow.md` retired; `implement.md` and `fix.md` updated to invoke the new loop directly
 
 **Task-runner agent (`agents/task-runner.md`):**
@@ -446,9 +559,54 @@ All three components needed to reach a runnable state. `dev_team.py` exits with 
 - [ ] Returns exactly one line matching a `result_format` value; returns `"failed"` and writes parse-error note to `<!-- section:Troubleshooter Log -->` if output cannot be mapped
 - [ ] Given a pipeline researcher step, when the task-runner is spawned with `skill: researcher-plan`, then the researcher brief is written to the context file and `"briefed"` is returned
 
+**Script-runner agent (`agents/script-runner.md`):**
+- [ ] Agent defined with tools: `Bash`, `Write`
+- [ ] Parses prompt fields: `command`, `log_file`, `result_format`
+- [ ] Runs `command` via `Bash`, capturing stdout and stderr
+- [ ] Writes full combined output to `log_file` via `Write`
+- [ ] Returns exactly one line: `passed — log: <log_file>` or `failed — log: <log_file>`
+- [ ] Given `dotnet build` exits 0, when script-runner runs, then it returns `passed — log: <path>` and the log file contains full build output
+
 ---
 
-### Task 2: Environment setup 🧑
+### Task 2: Step protocol refactor — `get_actions` / `handle_results` / `ParallelSteps` 🤖
+
+_Depends on Task 1. Refactor only — no behaviour changes visible to the pipeline._
+
+Introduce a clean two-method `Step` protocol that replaces the current `execute()`/`exit_with_actions()` pattern. Every step expresses what it wants to do (`get_actions`) and how it interprets the outcome (`handle_results`). Parallelism is expressed through a generic `ParallelSteps` composite rather than bespoke coordination logic inside individual steps.
+
+**`Step` base class:**
+- [ ] `get_actions(self) -> list[dict]` — returns a list of action descriptors (`spawn_agent` or `run_script` items); replaces direct calls to `exit_with_actions()`
+- [ ] `handle_results(self, results: list[str]) -> str` — accepts the ordered list of one-line result strings (one per action from the previous `get_actions` call) and returns a branch moniker (e.g., `"approved"`, `"changes_requested"`, `"implemented"`)
+- [ ] Steps no longer call `exit_with_actions()` directly; the state machine owns the exit
+
+**State machine loop in `dev_team.py`:**
+- [ ] Script invoked **with** `--results <comma-separated>`: parse results → `current_step.handle_results(results)` → get branch moniker → transition to next step → `next_step.get_actions()` → `exit_with_actions(actions)`
+- [ ] Script invoked **without** `--results` (recovery / initial run): `current_step.get_actions()` → `exit_with_actions(actions)`
+- [ ] If `get_actions()` returns `[]` (inline step): immediately call `handle_results([])` → transition → call `get_actions()` on next step → continue; guard against infinite inline loop (raise if step pointer does not advance)
+- [ ] `dev-team.md` updated to collect all one-line results from parallel agents/scripts and pass them as `--results "r1,r2,r3"` on the next script invocation
+
+**`ParallelSteps` composite:**
+- [ ] `__init__(self, steps: list[Step])` — holds ordered list of child steps
+- [ ] `get_actions()` — calls `get_actions()` on each child and returns the concatenated flat list; records how many actions each child contributed (for result distribution)
+- [ ] `handle_results(results)` — splits the flat result list by child action counts; calls `handle_results` on each child; passes all child branch monikers to `combine_results()`
+- [ ] `combine_results(self, child_monikers: list[str]) -> str` — default implementation: `"failed"` if any child returned `"failed"`; `"changes_requested"` if any returned `"changes_requested"`; otherwise the first moniker (assumes homogeneous success values). Subclasses may override.
+
+**Refactor `SignOffStep`:**
+- [ ] Decompose into `ReviewerSignOffStep`, `ResearcherSignOffStep`, and `BuildValidationStep` — each a simple single-action step
+- [ ] `SignOffStep` becomes a `ParallelSteps` wrapping these three (or the applicable subset per workflow), with `combine_results` using the precedence rule above
+- [ ] All sign-off-specific parallel coordination logic removed from the old `SignOffStep`
+
+**Tests:**
+- [ ] Unit tests for `ParallelSteps.get_actions()` — flat list is correct concatenation of children
+- [ ] Unit tests for `ParallelSteps.handle_results()` — results distributed correctly by action count; `combine_results` precedence verified
+- [ ] Unit tests for inline step (empty `get_actions`) — state machine advances without exiting; infinite-loop guard fires on non-advancing step
+- [ ] Unit tests for `--results` parsing and absence (recovery path)
+- [ ] Given an existing workflow, when the refactored state machine runs end-to-end in tests, then it produces the same sequence of exits as the pre-refactor code
+
+---
+
+### Task 3: Environment setup 🧑 (ADR-274)
 
 One-time operator configuration required before the pipeline can run. No code changes.
 
@@ -459,9 +617,9 @@ One-time operator configuration required before the pipeline can run. No code ch
 
 ---
 
-### Task 3: End-to-end pipeline validation 🤖
+### Task 4: End-to-end pipeline validation 🤖 (ADR-275)
 
-_Depends on Tasks 1 and 2._
+_Depends on Tasks 1, 2, and 3._
 
 Run a full implement pipeline cycle to confirm the step-machine architecture works end-to-end.
 
@@ -472,7 +630,7 @@ Run a full implement pipeline cycle to confirm the step-machine architecture wor
 
 ---
 
-### Task 4: Troubleshooter agent 🤖
+### Task 5: Troubleshooter agent 🤖 (ADR-276)
 
 _Can run after Task 3 or in parallel. The pipeline is fully functional without it._
 

@@ -20,5 +20,5 @@ Then stop.
 
 ### 2 — Run the workflow
 
-Invoke the `run-workflow` skill with arguments:
+Invoke the `dev-team` skill with arguments:
 `<work-item-id> implement-task-plan researcher-plan`
