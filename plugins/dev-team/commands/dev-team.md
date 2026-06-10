@@ -108,34 +108,7 @@ Handle the outcome (a JSON object with `action` field):
      ```
   3. Continue the loop
 
-**If `descriptors` is a single-item array and `descriptors[0].action == "spawn_agent"`:**
-
-Spawn the task-runner agent:
-```
-Agent(
-  subagent_type="task-runner",
-  prompt="""
-agent: <descriptors[0].agent>
-skill: <descriptors[0].skill>
-context_file: <descriptors[0].context_file>
-args: <descriptors[0].args or "">
-read_sections: <descriptors[0].read_sections joined by ", ">
-write_section: <descriptors[0].write_section>
-result_format: <descriptors[0].result_format>
-"""
-)
-```
-
-Display any `message` field from the descriptor to the user before spawning.
-
-The task-runner returns exactly one line (the result indicator). Log it:
-```
-[<work-item-id>] <skill>: <result>
-```
-
-Then continue the loop.
-
-**All other lists (multiple items or a single `run_script` item):**
+**All other lists (multiple items, a single `spawn_agent` item, or a single `run_script` item):**
 
 Dispatch all items in parallel — `spawn_agent` items via `Agent(subagent_type="task-runner")`,
 `run_script` items via `Agent(subagent_type="script-runner")`:
