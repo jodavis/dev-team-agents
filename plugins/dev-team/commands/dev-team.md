@@ -99,17 +99,18 @@ Handle the outcome (a JSON object with `action` field):
 - `"needs_user_input"` →
   1. Ask the user the troubleshooter's question
   2. Write the user's answer to the `troubleshooter_input` frontmatter key in the
-     context file using a Python one-liner:
+     context file by passing the answer via stdin (avoids shell injection):
      ```bash
      python -c "
-     from pathlib import Path
-     import re
+     from pathlib import Path; import re, sys
      path = Path('<context_file>')
+     answer = sys.stdin.read().strip()
      text = path.read_text(encoding='utf-8')
-     answer = '<user_answer>'
      text = re.sub(r'troubleshooter_input:.*', f'troubleshooter_input: {answer}', text)
      path.write_text(text, encoding='utf-8')
-     "
+     " <<'ANSWER_HEREDOC'
+     <user_answer>
+     ANSWER_HEREDOC
      ```
   3. Continue the loop
 
