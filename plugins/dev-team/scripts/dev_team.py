@@ -862,6 +862,7 @@ class FixPrStep(Step):
         if len(ctx.work_summaries) > completed:
             _handle_agent_success(ctx)
             ctx.review_fix_iteration += 1
+            ctx.review_notes = ""  # ensure ReviewStep re-runs reviewer on next cycle
             return "fix_done"
 
         if ctx.review_fix_iteration >= MAX_REVIEW_FIX_ITERATIONS:
