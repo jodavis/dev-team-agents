@@ -33,22 +33,12 @@ appropriate agent for each step.
 ### 1 — Compute context file path
 
 ```bash
-# Derive repo slug from git remote
-git remote get-url origin
-```
-
-Strip the host prefix and `.git` suffix from the URL to form `<repo-slug>`
-(e.g. `https://github.com/jodavis/AdaptiveRemote.git` → `jodavis/AdaptiveRemote`).
-
-Then compute the context file path:
-```bash
-context_file=$(python ${CLAUDE_PLUGIN_ROOT}/scripts/dev_team.py <work-item-id> --print-context-path <repo-slug>)
-```
-
-Create the directory if it does not exist:
-```bash
+context_file=$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/get-context-path.sh" "<work-item-id>")
 mkdir -p "$(dirname "$context_file")"
 ```
+
+> **Note:** On Windows this runs via Git Bash, which ships with Git-for-Windows. No
+> platform-detection branch is needed.
 
 ### 2 — Orchestration loop
 
