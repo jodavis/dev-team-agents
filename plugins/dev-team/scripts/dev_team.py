@@ -713,6 +713,9 @@ class SignoffStep(Step):
                 "result_format": "approved | changes_requested",
             })
 
+        # signoff_review is populated — reviewer agent succeeded
+        _handle_agent_success(ctx)
+
         # Sub-step 2: researcher validate
         if not ctx.signoff_research:
             if ctx.pending_agent == self._PENDING_RESEARCHER:
@@ -737,6 +740,9 @@ class SignoffStep(Step):
                 "write_section": "Signoff Research",
                 "result_format": "validated | failed",
             })
+
+        # signoff_research is populated — researcher-validate agent succeeded
+        _handle_agent_success(ctx)
 
         # Sub-step 3: run scripts in-process
         failures: list[str] = []
@@ -958,8 +964,6 @@ class DevTeamPipeline:
             current_state = self.machine.state
             trigger = step.run(self.ctx)
 
-            # step.run() returned normally — update counters
-            _handle_agent_success(self.ctx)
             _apply_counter_updates(self.ctx, current_state, trigger)
 
             # Check trigger-based troubleshooter conditions
