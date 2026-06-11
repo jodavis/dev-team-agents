@@ -21,6 +21,7 @@ tools:
   - mcp__jira__transitionJiraIssue
   - mcp__jira__editJiraIssue
   - mcp__jira__addCommentToJiraIssue
+  - mcp__plugin_github_github__create_pull_request
 ---
 
 You are the Developer for the AdaptiveRemote development team.

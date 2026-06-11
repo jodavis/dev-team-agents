@@ -202,6 +202,7 @@ class PipelineContext:
     signoff_review: str = ""
     signoff_research: str = ""
     signoff_build_result: str = ""
+    validate_result: str = ""
     # Counters tracked for troubleshooter trigger conditions
     signoff_cycle_count: int = 0
     consecutive_failures: int = 0
@@ -264,6 +265,9 @@ class PipelineContext:
         if self.signoff_build_result:
             lines += ["", "<!-- section:Signoff Build Result -->", "", self.signoff_build_result.strip()]
 
+        if self.validate_result:
+            lines += ["", "<!-- section:Validate Result -->", "", self.validate_result.strip()]
+
         log_links: list[str] = []
         if self.build_log:
             log_links.append(f"- Build: {self.build_log}")
@@ -320,6 +324,7 @@ class PipelineContext:
         ctx.signoff_review = sections.get("Signoff Review", "")
         ctx.signoff_research = sections.get("Signoff Research", "")
         ctx.signoff_build_result = sections.get("Signoff Build Result", "")
+        ctx.validate_result = sections.get("Validate Result", "")
 
         return ctx
 
@@ -417,26 +422,35 @@ def parse_json_output(text: str) -> dict:
 def _researcher_validated(content: str) -> bool:
     """Return True if researcher-validate reported success.
 
-    The task-runner writes the one-line result indicator from result_format
-    ("validated" | "failed") to the Signoff Research section.  Fall back to
-    JSON-array parsing for output written by older skill versions.
+    Expects a JSON object with a "status" field ("validated" | "failed"),
+    matching the standardized skill output format.
     """
-    text = content.strip()
-    if text == "validated":
+    result = parse_json_output(content)
+    status = result.get("status", "")
+    if status == "validated":
         return True
-    if text == "failed":
+    if status == "failed":
         return False
-    # Legacy / raw skill output: look for a JSON array with fail/partial items.
-    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
-    candidate = fenced.group(1).strip() if fenced else text
-    try:
-        data = json.loads(candidate)
-        if isinstance(data, list):
-            return not any(item.get("status") in ("fail", "partial") for item in data)
-    except (json.JSONDecodeError, TypeError):
-        pass
     # Unrecognised format — treat as not validated so signoff retries.
     return False
+
+
+def _parse_approval_status(content: str) -> str:
+    """Extract approval status from agent output.
+
+    Returns "approved" or "changes_requested". Falls back to scanning the
+    content for the word "approved" if JSON parsing fails, to guard against
+    minor output format deviations.
+    """
+    result = parse_json_output(content)
+    status = result.get("status", "")
+    if status in ("approved", "changes_requested"):
+        return status
+    # Secondary heuristic: look for the keyword in the text
+    lower = content.lower()
+    if "approved" in lower and "changes_requested" not in lower:
+        return "approved"
+    return "changes_requested"
 
 
 def _troubleshooter_descriptor(
@@ -605,6 +619,7 @@ class ImplementStep(Step):
             "message": "Researcher has written the task brief. Developer is now implementing.",
             "agent": "developer",
             "skill": "developer-implement",
+            "args": ctx.work_item_id,
             "context_file": str(self._context_path),
             "read_sections": ["Researcher Brief"],
             "write_section": "Implementation Summary",
@@ -615,49 +630,57 @@ class ImplementStep(Step):
 class ValidateStep(Step):
     handles = "validating"
 
-    def __init__(self, log_dir: Path) -> None:
+    _PENDING_KEY = "validate"
+
+    def __init__(self, context_path: Path, log_dir: Path) -> None:
+        self._context_path = context_path
         self._log_dir = log_dir
 
     def run(self, ctx: PipelineContext) -> str:
-        print("Running scripts/validate-build...", flush=True)
-        try:
-            build_ok, build_log, build_tail = run_validate_script("validate-build", self._log_dir)
-        except (FileNotFoundError, OSError) as e:
-            print(f"Error running validate-build:\n{e}", file=sys.stderr)
-            sys.exit(1)
-
-        ctx.build_log = str(build_log)
-        if not build_ok:
-            print(f"Build FAILED. Log: {build_log}", flush=True)
+        if ctx.validate_result:
+            # Re-entry: script-runner has written the result.
+            result = ctx.validate_result.strip()
+            ctx.validate_result = ""
+            ctx.pending_agent = ""
+            if result == "passed":
+                print("Validation passed.", flush=True)
+                ctx.last_failure = ""
+                _commit_and_push(ctx.work_item_id)
+                return "clean"
+            print(f"Validation FAILED. Log: {ctx.build_log}", flush=True)
             ctx.last_failure = (
-                f"Build failed.\n\n"
-                f"Full log (read this for details): {build_log}\n\n"
-                f"Last 30 lines:\n```\n{build_tail}\n```"
+                f"Build or test failures.\n\n"
+                f"Full log (read this for details): {ctx.build_log}"
             )
             return "build_failed"
 
-        print(f"Build clean. Log: {build_log}", flush=True)
-        print("Running scripts/validate-tests...", flush=True)
-        try:
-            tests_ok, tests_log, tests_tail = run_validate_script("validate-tests", self._log_dir)
-        except (FileNotFoundError, OSError) as e:
-            print(f"Error running validate-tests:\n{e}", file=sys.stderr)
-            sys.exit(1)
-
-        ctx.test_log = str(tests_log)
-        if not tests_ok:
-            print(f"Tests FAILED. Log: {tests_log}", flush=True)
-            ctx.last_failure = (
-                f"Test failures.\n\n"
-                f"Full log (read this for details): {tests_log}\n\n"
-                f"Last 30 lines:\n```\n{tests_tail}\n```"
+        if ctx.pending_agent == self._PENDING_KEY:
+            # Re-entry with no result — script-runner failed to write outcome.
+            _handle_agent_failure(ctx)
+            _check_and_trigger_troubleshooter(
+                "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
+                ctx.consecutive_failures, ctx, self._context_path,
             )
-            return "tests_failed"
 
-        print(f"Tests clean. Log: {tests_log}", flush=True)
-        ctx.last_failure = ""
-        _commit_and_push(ctx.work_item_id)
-        return "clean"
+        self._log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+        log_path = self._log_dir / f"{ctx.work_item_id}-validate-{timestamp}.log"
+        ctx.build_log = str(log_path)
+        ctx.pending_agent = self._PENDING_KEY
+        ctx.save(self._context_path)
+
+        ext = ".cmd" if sys.platform == "win32" else ".sh"
+        validate_script = REPO_ROOT / "scripts" / f"validate{ext}"
+        command = f'cmd /c "{validate_script}"' if sys.platform == "win32" else f'bash "{validate_script}"'
+        print(f"Spawning script-runner to validate {ctx.work_item_id}...", flush=True)
+        exit_with_actions([{
+            "action": "run_script",
+            "message": "Running build and test validation.",
+            "command": command,
+            "log_file": str(log_path),
+            "write_section": "Validate Result",
+            "result_format": "passed | failed",
+        }])
 
 
 class ReviewStep(Step):
@@ -703,6 +726,7 @@ class ReviewStep(Step):
                 "message": "Implementation complete. Developer is creating a pull request.",
                 "agent": "developer",
                 "skill": "developer-create-pr",
+                "args": ctx.work_item_id,
                 "context_file": str(self._context_path),
                 "read_sections": read_sections,
                 "write_section": "PR URL",
@@ -712,8 +736,7 @@ class ReviewStep(Step):
         # Sub-step 2: review
         if ctx.review_notes:
             _handle_agent_success(ctx)
-            result = parse_json_output(ctx.review_notes)
-            status = result.get("status", "changes_requested")
+            status = _parse_approval_status(ctx.review_notes)
             if status == "approved":
                 print("Review approved.", flush=True)
                 return "approved"
@@ -898,8 +921,7 @@ class SignoffStep(Step):
                 f"Script result: {ctx.signoff_build_result.strip()}"
             )
 
-        reviewer_result = parse_json_output(ctx.signoff_review)
-        reviewer_approved = reviewer_result.get("status", "changes_requested") == "approved"
+        reviewer_approved = _parse_approval_status(ctx.signoff_review) == "approved"
         if not reviewer_approved:
             failures.append(f"Reviewer sign-off:\n{ctx.signoff_review}")
 
@@ -978,6 +1000,7 @@ class FixStep(Step):
             ),
             "agent": "developer",
             "skill": "developer-fix",
+            "args": ctx.work_item_id,
             "context_file": str(self._context_path),
             "read_sections": read_sections,
             "write_section": write_section,
@@ -1046,6 +1069,7 @@ class FixPrStep(Step):
             ),
             "agent": "developer",
             "skill": "developer-fix",
+            "args": ctx.work_item_id,
             "context_file": str(self._context_path),
             "read_sections": read_sections,
             "write_section": write_section,
@@ -1078,7 +1102,7 @@ class DevTeamPipeline:
             "debugging": DebugStep(context_path),
             "researching": ResearchStep(research_skill, context_path),
             "implementing": ImplementStep(context_path),
-            "validating": ValidateStep(log_dir),
+            "validating": ValidateStep(context_path, log_dir),
             "fixing": FixStep(context_path),
             "reviewing": ReviewStep(context_path),
             "signoff": SignoffStep(context_path, log_dir),
@@ -1213,49 +1237,6 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
     return metadata, body
 
 
-def run_validate_script(script_name: str, log_dir: Path) -> tuple[bool, Path, str]:
-    """Run a validate script from the scripts/ directory.
-
-    Logs full output to a timestamped file under log_dir.
-    Returns (success, log_path, tail) where tail is the last 30 lines.
-    """
-    scripts_dir = REPO_ROOT / "scripts"
-    ext = ".cmd" if sys.platform == "win32" else ".sh"
-    script_path = scripts_dir / f"{script_name}{ext}"
-
-    if not script_path.exists():
-        raise FileNotFoundError(
-            f"Validate script not found: scripts/{script_name}{ext}"
-        )
-
-    log_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
-    log_path = log_dir / f"{timestamp}-{script_name}.txt"
-
-    if sys.platform == "win32":
-        invoke = ["cmd", "/c", str(script_path)]
-    else:
-        invoke = [str(script_path)]
-
-    proc = subprocess.Popen(
-        invoke,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        cwd=REPO_ROOT,
-    )
-
-    lines: list[str] = []
-    with log_path.open("w", encoding="utf-8") as log_file:
-        for line in proc.stdout:  # type: ignore[union-attr]
-            log_file.write(line)
-            lines.append(line)
-
-    proc.wait()
-    tail = "".join(lines[-30:])
-    return proc.returncode == 0, log_path, tail
 
 
 def find_spec_file(work_item_id: str) -> Path:

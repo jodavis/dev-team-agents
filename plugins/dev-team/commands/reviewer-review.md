@@ -36,15 +36,27 @@ error and stop.
 
 ## Step 4 — Retrieve and read the diff
 
-Fetch the PR diff using the `gh` CLI:
+Extract the pull number from `$PR_URL` (last path segment). Parse `owner` and `repo` from
+the URL (e.g. `https://github.com/owner/repo/pull/123`).
 
-```bash
-gh pr diff <pull-number>
+Fetch the PR diff using the GitHub MCP:
+
+```
+mcp__plugin_github_github__pull_request_read(method="get_diff", owner=<owner>, repo=<repo>, pullNumber=<number>)
 ```
 
 Read all changed files in full to understand the complete context of each change.
 
-## Step 5 — Review the changes
+## Step 5 — Create a pending review
+
+Before reviewing, create a pending review so inline comments can be added as issues are
+discovered:
+
+```
+mcp__plugin_github_github__pull_request_review_write(method="create", owner=<owner>, repo=<repo>, pullNumber=<number>)
+```
+
+## Step 6 — Review the changes
 
 Evaluate the diff against each dimension below, in priority order. For each issue you
 find, note the file, line number, and a clear description of the problem.
@@ -88,38 +100,35 @@ find, note the file, line number, and a clear description of the problem.
 - Do tests use `MockBehavior.Strict` and `Expect_*` helpers?
 - Is there a `CreateSut()` method?
 
-## Step 6 — Post the GitHub PR review
+## Step 7 — Post each inline issue as you find it
 
-Create a **pull request review** (not a regular PR comment) using the `gh` CLI:
+For each Priority 1–4 issue discovered in step 6, post it immediately to the pending
+review using the **source file line number** (not the diff position):
 
-```bash
-gh api "repos/${GITHUB_REPOSITORY}/pulls/<pull-number>/reviews" \
-  --method POST \
-  --field body='<overall summary>' \
-  --field event='COMMENT' \
-  --field comments='[{"path":"<file>","position":<diff-position>,"body":"<comment>"}]'
+```
+mcp__plugin_github_github__add_comment_to_pending_review(owner=<owner>, repo=<repo>, pullNumber=<number>, path=<file>, line=<line>, side="RIGHT", subjectType="LINE", body=<comment>)
 ```
 
-Notes:
-- Use `event: COMMENT`, not `APPROVE` or `REQUEST_CHANGES` — GitHub rejects those from
-  the PR author's account, and the developer and reviewer agents share the same account.
-- Each entry in `comments` must use the **diff position** (line number within the unified
-  diff), not the source file line number. Run `gh pr diff <number>`
-  and count lines from the start of each file's hunk to get the position.
-- Do NOT use `POST /repos/.../issues/{number}/comments` — that creates a plain conversation
-  comment, not a structured review thread.
+## Step 8 — Submit the review
 
-## Step 7 — Output
+Submit the pending review with an overall summary. Use `event: COMMENT` — do not use
+`APPROVE` or `REQUEST_CHANGES`, as GitHub rejects those when the reviewer and PR author
+share the same account.
+
+```
+mcp__plugin_github_github__pull_request_review_write(method="submit_pending", owner=<owner>, repo=<repo>, pullNumber=<number>, body=<overall summary>, event="COMMENT")
+```
+
+## Step 9 — Output
 
 Write a concise plain-text summary of all issues found (one bullet per issue, Priority
 1–4 first, style issues last). This summary will be passed to the developer so they can
 address each point without re-reading the full PR thread.
 
-Then output the JSON result as the final line:
+Then output the following JSON object as the very last line of your response.
+Write it as a bare JSON object — do not wrap it in a code block or add any text after it:
 
-```json
 {"status": "approved|changes_requested", "pr_url": "https://github.com/..."}
-```
 
 Use `"approved"` if no Priority 1–4 issues were found; `"changes_requested"` otherwise.
 Always include the PR URL even when approving.

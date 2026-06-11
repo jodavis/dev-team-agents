@@ -304,51 +304,72 @@ class TestTroubleshooterInput:
 
 
 # ---------------------------------------------------------------------------
+# _parse_approval_status
+# ---------------------------------------------------------------------------
+
+class TestParseApprovalStatus:
+    def test_approved_json_returns_approved(self):
+        from dev_team import _parse_approval_status
+        assert _parse_approval_status('{"status": "approved"}') == "approved"
+
+    def test_changes_requested_json_returns_changes_requested(self):
+        from dev_team import _parse_approval_status
+        assert _parse_approval_status('{"status": "changes_requested"}') == "changes_requested"
+
+    def test_bare_approved_word_returns_approved(self):
+        from dev_team import _parse_approval_status
+        # Secondary heuristic when JSON parsing fails: "approved" keyword present
+        assert _parse_approval_status("LGTM. Status: approved.") == "approved"
+
+    def test_both_words_present_returns_changes_requested(self):
+        from dev_team import _parse_approval_status
+        # If both keywords appear, don't false-positive as approved
+        content = "Previously approved but now changes_requested."
+        assert _parse_approval_status(content) == "changes_requested"
+
+    def test_unrecognised_content_defaults_to_changes_requested(self):
+        from dev_team import _parse_approval_status
+        assert _parse_approval_status("some random output") == "changes_requested"
+
+    def test_json_with_pr_url_approved(self):
+        from dev_team import _parse_approval_status
+        content = '{"status": "approved", "pr_url": "https://github.com/org/repo/pull/1"}'
+        assert _parse_approval_status(content) == "approved"
+
+
+# ---------------------------------------------------------------------------
 # _researcher_validated
 # ---------------------------------------------------------------------------
 
 class TestResearcherValidated:
-    def test_validated_indicator_returns_true(self):
+    def test_validated_json_object_returns_true(self):
         from dev_team import _researcher_validated
-        assert _researcher_validated("validated") is True
+        assert _researcher_validated('{"status": "validated"}') is True
 
-    def test_failed_indicator_returns_false(self):
+    def test_failed_json_object_returns_false(self):
         from dev_team import _researcher_validated
-        assert _researcher_validated("failed") is False
+        assert _researcher_validated('{"status": "failed"}') is False
 
-    def test_validated_with_whitespace_returns_true(self):
+    def test_validated_with_criteria_array_returns_true(self):
         from dev_team import _researcher_validated
-        assert _researcher_validated("  validated\n") is True
-
-    def test_failed_with_whitespace_returns_false(self):
-        from dev_team import _researcher_validated
-        assert _researcher_validated("  failed\n") is False
-
-    def test_json_array_all_pass_returns_true(self):
-        from dev_team import _researcher_validated
-        content = '[{"status": "pass", "criterion": "Tests pass"}]'
+        content = '{"status": "validated", "criteria": [{"criterion": "Tests pass", "status": "pass"}]}'
         assert _researcher_validated(content) is True
 
-    def test_json_array_with_fail_returns_false(self):
+    def test_failed_with_criteria_array_returns_false(self):
         from dev_team import _researcher_validated
-        content = '[{"status": "fail", "criterion": "Tests pass"}]'
+        content = '{"status": "failed", "criteria": [{"criterion": "Tests pass", "status": "fail", "finding": "not met"}]}'
         assert _researcher_validated(content) is False
 
-    def test_json_array_with_partial_returns_false(self):
+    def test_validated_embedded_in_prose_returns_true(self):
         from dev_team import _researcher_validated
-        content = '[{"status": "partial", "criterion": "Tests pass"}]'
-        assert _researcher_validated(content) is False
-
-    def test_json_array_in_fenced_block_with_fail(self):
-        from dev_team import _researcher_validated
-        content = '```json\n[{"status": "fail", "criterion": "x"}]\n```'
-        assert _researcher_validated(content) is False
-
-    def test_description_containing_never_failed_is_not_false_positive(self):
-        from dev_team import _researcher_validated
-        # "failed" substring in a description must not cause a false-positive
-        content = '[{"status": "pass", "criterion": "Tests never failed"}]'
+        # JSON on its own line within agent prose output
+        content = 'All criteria were met.\n{"status": "validated", "criteria": []}'
         assert _researcher_validated(content) is True
+
+    def test_failed_embedded_in_prose_returns_false(self):
+        from dev_team import _researcher_validated
+        content = 'Some criteria were not met.\n{"status": "failed", "criteria": []}'
+        assert _researcher_validated(content) is False
 
     def test_unrecognised_content_returns_false(self):
         from dev_team import _researcher_validated
