@@ -569,7 +569,7 @@ All three components needed to reach a runnable state. `dev_team.py` exits with 
 
 ---
 
-### Task 2: Step protocol refactor — `get_actions` / `handle_results` / `ParallelSteps` 🤖
+### Task 2: Step protocol refactor — `get_actions` / `handle_results` / `ParallelSteps` 🤖 (ADR-277)
 
 _Depends on Task 1. Refactor only — no behaviour changes visible to the pipeline._
 
