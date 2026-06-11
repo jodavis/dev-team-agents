@@ -37,29 +37,38 @@ stop:
 {"pr_url": "$PR_URL"}
 ```
 
-### 2 — Determine the base branch
+### 2 — Determine the base branch and repo coordinates
 
 Using Bash:
 
-1. Run `git fetch --all --quiet` to ensure remote branches are up to date.
-2. List candidate base branches in priority order:
+1. Get the current branch name: `git branch --show-current`
+2. Run `git fetch --all --quiet` to ensure remote branches are up to date.
+3. List candidate base branches in priority order:
    - `main`
    - Any remote `feature/*` branches: `git branch -r | grep "feature/" | sed "s|.*origin/||"`
-3. For each candidate, count how many commits HEAD is ahead of it:
+4. For each candidate, count how many commits HEAD is ahead of it:
    ```bash
    git rev-list --count origin/<candidate>..HEAD 2>/dev/null || echo 99999
    ```
-4. Select the candidate with the fewest commits (the closest ancestor to HEAD). If two
+5. Select the candidate with the fewest commits (the closest ancestor to HEAD). If two
    candidates tie, prefer `main`. If no candidate is reachable, fall back to `main`.
+6. Parse owner and repo from the remote URL:
+   ```bash
+   git remote get-url origin
+   ```
+   Extract `owner` and `repo` from formats like `https://github.com/owner/repo.git`
+   or `git@github.com:owner/repo.git`.
 
 ### 3 — Create the draft PR
 
-Use `gh pr create` with:
+Use `mcp__plugin_github_github__create_pull_request` with:
 
-- `--draft`
-- `--base <base branch from step 2>`
-- `--title "<work-item-id>: <concise one-line description of what the implementation delivers>"`
-- `--body` A well-structured description with these sections:
+- `owner` and `repo` from step 2
+- `head`: the current branch name from step 2
+- `base`: the base branch from step 2
+- `draft`: `true`
+- `title`: `"<work-item-id>: <concise one-line description of what the implementation delivers>"`
+- `body`: A well-structured description with these sections:
   - **Work item:** `<work-item-id>` with a one-sentence summary of what the task required
   - **Changes:** A bullet list drawn from the work summaries — one bullet per logical change
     (new file, modified interface, new test scenario, etc.)
@@ -75,6 +84,4 @@ The PR title and body are read by human reviewers — write them clearly and pre
 
 Output the PR URL as the final JSON line:
 
-```json
 {"pr_url": "https://github.com/..."}
-```

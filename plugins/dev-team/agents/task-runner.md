@@ -86,7 +86,7 @@ Agent(
 The sub-agent invokes the named skill and returns its full output. Capture that output
 as the skill result for Step 4.
 
-### Step 4 — Write result to context file
+### Step 4 — Write result to context file (Edit only — never Write)
 
 Overwrite `write_section` in `context_file` with the skill's full output.
 
@@ -97,10 +97,24 @@ The section format in the file is:
 <content>
 ```
 
-If the section already exists in the file, replace it entirely (including the sentinel
-line). If it does not exist, append it after the last existing section.
+Use `Read` to read the current file content, then use **`Edit` only — never `Write`**.
+Using `Write` would overwrite the entire file and erase sections written by other
+concurrent agents.
 
-Use `Read` to read the current file content, then `Edit` or `Write` to update it.
+**If the sentinel `<!-- section:<write_section> -->` already exists in the file:**
+
+Use `Edit` where:
+- `old_string` = the sentinel line, the blank line after it, and all content up to
+  (but not including) the next `<!-- section:` marker or the end of the file
+- `new_string` = `<!-- section:<write_section> -->\n\n<skill output>\n`
+
+**If the sentinel does not exist (new section):**
+
+Find the last `<!-- section:...` line in the file (and its content block that follows).
+Use `Edit` where:
+- `old_string` = that last sentinel line plus all content that follows it to end of file
+- `new_string` = that same block plus `\n\n<!-- section:<write_section> -->\n\n<skill output>\n`
+
 **Overwrite the entire section — never append to it.**
 
 ### Step 5 — Return result
