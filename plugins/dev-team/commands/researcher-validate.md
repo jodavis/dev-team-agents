@@ -48,23 +48,21 @@ exercises the scenario — not just that the code path exists.
 
 ### 3 — Return the result
 
-Return a JSON array. Each entry is one exit criterion. Do not omit criteria even if they
-clearly pass — include them all so the caller has a complete picture.
+Output a JSON object as the very last line of your response (bare, not inside a code block).
+Set `status` to `"validated"` if all criteria passed, `"failed"` if any criterion is
+`fail` or `partial`. Include the full criteria array so the developer has details.
 
-```json
-[
-  {
-    "criterion": "Exact text of the exit criterion from the spec",
-    "status": "pass | fail | partial",
-    "finding": "One-sentence explanation. Required for fail and partial; omit for pass."
-  }
-]
 ```
+{"status": "validated|failed", "criteria": [{"criterion": "...", "status": "pass|fail|partial", "finding": "..."}]}
+```
+
+Each criterion entry:
+- `criterion` — exact text of the exit criterion from the spec
+- `status` — `pass`, `fail`, or `partial`
+- `finding` — one-sentence explanation (required for `fail` and `partial`; omit for `pass`)
 
 **Status definitions:**
 - `pass` — criterion is fully and demonstrably met by the code and tests
 - `partial` — criterion is met in part but not completely (e.g., happy path covered but
   error cases are not, or implementation exists but no test verifies it)
 - `fail` — criterion is not met
-
-Return only the JSON array — no surrounding text.
