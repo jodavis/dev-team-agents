@@ -46,6 +46,9 @@ Repeat the following until `action == "done"` or a terminal condition is reached
 
 #### 2a — Run the step machine
 
+On the first invocation and any invocation that does not follow a parallel dispatch,
+run without `--results`:
+
 ```bash
 python -u ${CLAUDE_PLUGIN_ROOT}/scripts/dev_team.py <work-item-id> \
   --workflow ${CLAUDE_PLUGIN_ROOT}/scripts/<workflow>.md \
@@ -53,6 +56,21 @@ python -u ${CLAUDE_PLUGIN_ROOT}/scripts/dev_team.py <work-item-id> \
   --plugin-root ${CLAUDE_PLUGIN_ROOT} \
   --context-file <context_file>
 ```
+
+After dispatching one or more parallel agents/scripts (step 2c below), collect all
+one-line results in the order they appear in the descriptor list and pass them back:
+
+```bash
+python -u ${CLAUDE_PLUGIN_ROOT}/scripts/dev_team.py <work-item-id> \
+  --workflow ${CLAUDE_PLUGIN_ROOT}/scripts/<workflow>.md \
+  --research-skill <research-skill> \
+  --plugin-root ${CLAUDE_PLUGIN_ROOT} \
+  --context-file <context_file> \
+  --results "<r1>,<r2>,<r3>"
+```
+
+The results string is a comma-separated list of the one-line outputs from each
+dispatched item, in the same order as the descriptor array.
 
 Capture all stdout. The last JSON array on stdout is the action descriptor list.
 
@@ -140,6 +158,9 @@ Log each result:
 [<work-item-id>] <item.skill or item.command>: <result>
 ```
 
+Collect the one-line result from each dispatched item in descriptor-list order.
+These become the `--results` argument on the next `dev_team.py` invocation (step 2a).
+
 For each `run_script` item that has a `write_section` field, write the one-line result
 to that section in the context file:
 ```bash
@@ -163,7 +184,7 @@ path.write_text(text, encoding='utf-8')
 "
 ```
 
-Then continue the loop.
+Then continue the loop, passing the collected results via `--results` on the next invocation.
 
 > **Note:** Once a pull request exists, build and test validation is performed by
 > GitHub Actions on the PR branch. The pipeline reads failing check output from

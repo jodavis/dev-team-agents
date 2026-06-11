@@ -492,15 +492,35 @@ class Step(ABC):
     handles: str
 
     @abstractmethod
-    def run(self, ctx: PipelineContext) -> str:
-        """Execute step logic. Returns a trigger name, OR calls exit_with_actions."""
+    def get_actions(self) -> list[dict]:
+        """Return action descriptors to dispatch. Empty list means inline step."""
         ...
+
+    @abstractmethod
+    def handle_results(self, results: list[str]) -> str:
+        """Accept one-line results (one per action) and return a trigger moniker."""
+        ...
+
+    def run(self, ctx: "PipelineContext") -> str:
+        """Deprecated shim — subclasses must implement get_actions/handle_results."""
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement get_actions() and handle_results() "
+            "instead of run()"
+        )
 
 
 class FindSpecStep(Step):
     handles = "spec-finding"
 
-    def run(self, ctx: PipelineContext) -> str:
+    def __init__(self, ctx: "PipelineContext") -> None:
+        self._ctx = ctx
+
+    def get_actions(self) -> list[dict]:
+        """Inline step — no actions needed."""
+        return []
+
+    def handle_results(self, results: list[str]) -> str:
+        ctx = self._ctx
         if ctx.spec_path:
             print("Spec path already set — skipping.", flush=True)
             return "spec_found"
@@ -516,29 +536,17 @@ class DebugStep(Step):
 
     _PENDING_KEY = "debug"
 
-    def __init__(self, context_path: Path) -> None:
+    def __init__(self, ctx: "PipelineContext", context_path: Path) -> None:
+        self._ctx = ctx
         self._context_path = context_path
 
-    def run(self, ctx: PipelineContext) -> str:
+    def get_actions(self) -> list[dict]:
+        ctx = self._ctx
         if ctx.debug_report:
-            _handle_agent_success(ctx)
-            if "# Debug report for" not in ctx.debug_report:
-                ctx.last_failure = f"Bug could not be reproduced.\n\n{ctx.debug_report}"
-                return "reproduction_failed"
-            print("Debugging complete.", flush=True)
-            return "debug_done"
-
-        if ctx.pending_agent == self._PENDING_KEY:
-            _handle_agent_failure(ctx)
-            _check_and_trigger_troubleshooter(
-                "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
-                ctx.consecutive_failures, ctx, self._context_path,
-            )
-
+            # Result already available — inline step
+            return []
         print(f"Debugger is investigating {ctx.work_item_id}...", flush=True)
-        ctx.pending_agent = self._PENDING_KEY
-        ctx.save(self._context_path)
-        exit_with_actions([{
+        return [{
             "action": "spawn_agent",
             "message": f"Debugger is investigating {ctx.work_item_id}.",
             "agent": "debugger",
@@ -548,7 +556,25 @@ class DebugStep(Step):
             "read_sections": [],
             "write_section": "Debug Report",
             "result_format": "reproduced | not_reproduced",
-        }])
+        }]
+
+    def handle_results(self, results: list[str]) -> str:
+        ctx = self._ctx
+        if ctx.debug_report:
+            _handle_agent_success(ctx)
+            if "# Debug report for" not in ctx.debug_report:
+                ctx.last_failure = f"Bug could not be reproduced.\n\n{ctx.debug_report}"
+                return "reproduction_failed"
+            print("Debugging complete.", flush=True)
+            return "debug_done"
+        # Agent ran but wrote nothing
+        _handle_agent_failure(ctx)
+        _check_and_trigger_troubleshooter(
+            "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
+            ctx.consecutive_failures, ctx, self._context_path,
+        )
+        # If we get here, consecutive_failures has not hit threshold — return failure trigger
+        return "reproduction_failed"
 
 
 class ResearchStep(Step):
@@ -556,28 +582,18 @@ class ResearchStep(Step):
 
     _PENDING_KEY = "research"
 
-    def __init__(self, skill: str, context_path: Path) -> None:
+    def __init__(self, skill: str, ctx: "PipelineContext", context_path: Path) -> None:
         self._skill = skill
+        self._ctx = ctx
         self._context_path = context_path
 
-    def run(self, ctx: PipelineContext) -> str:
+    def get_actions(self) -> list[dict]:
+        ctx = self._ctx
         if ctx.brief:
-            _handle_agent_success(ctx)
-            print("Research complete.", flush=True)
-            return "research_done"
-
-        if ctx.pending_agent == self._PENDING_KEY:
-            _handle_agent_failure(ctx)
-            _check_and_trigger_troubleshooter(
-                "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
-                ctx.consecutive_failures, ctx, self._context_path,
-            )
-
+            return []
         print(f"Researcher is planning work for {ctx.work_item_id}...", flush=True)
         read_sections = ["Debug Report"] if ctx.debug_report else []
-        ctx.pending_agent = self._PENDING_KEY
-        ctx.save(self._context_path)
-        exit_with_actions([{
+        return [{
             "action": "spawn_agent",
             "message": f"Researcher is planning work for {ctx.work_item_id}.",
             "agent": "researcher",
@@ -587,7 +603,20 @@ class ResearchStep(Step):
             "read_sections": read_sections,
             "write_section": "Researcher Brief",
             "result_format": "briefed | failed",
-        }])
+        }]
+
+    def handle_results(self, results: list[str]) -> str:
+        ctx = self._ctx
+        if ctx.brief:
+            _handle_agent_success(ctx)
+            print("Research complete.", flush=True)
+            return "research_done"
+        _handle_agent_failure(ctx)
+        _check_and_trigger_troubleshooter(
+            "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
+            ctx.consecutive_failures, ctx, self._context_path,
+        )
+        return "research_done"
 
 
 class ImplementStep(Step):
@@ -595,26 +624,16 @@ class ImplementStep(Step):
 
     _PENDING_KEY = "implement"
 
-    def __init__(self, context_path: Path) -> None:
+    def __init__(self, ctx: "PipelineContext", context_path: Path) -> None:
+        self._ctx = ctx
         self._context_path = context_path
 
-    def run(self, ctx: PipelineContext) -> str:
+    def get_actions(self) -> list[dict]:
+        ctx = self._ctx
         if ctx.work_summaries:
-            _handle_agent_success(ctx)
-            print("Implementation already complete in context — skipping.", flush=True)
-            return "impl_done"
-
-        if ctx.pending_agent == self._PENDING_KEY:
-            _handle_agent_failure(ctx)
-            _check_and_trigger_troubleshooter(
-                "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
-                ctx.consecutive_failures, ctx, self._context_path,
-            )
-
+            return []
         print(f"Developer is implementing {ctx.work_item_id}...", flush=True)
-        ctx.pending_agent = self._PENDING_KEY
-        ctx.save(self._context_path)
-        exit_with_actions([{
+        return [{
             "action": "spawn_agent",
             "message": "Researcher has written the task brief. Developer is now implementing.",
             "agent": "developer",
@@ -624,7 +643,20 @@ class ImplementStep(Step):
             "read_sections": ["Researcher Brief"],
             "write_section": "Implementation Summary",
             "result_format": "implemented | failed | needs_clarification",
-        }])
+        }]
+
+    def handle_results(self, results: list[str]) -> str:
+        ctx = self._ctx
+        if ctx.work_summaries:
+            _handle_agent_success(ctx)
+            print("Implementation already complete in context — skipping.", flush=True)
+            return "impl_done"
+        _handle_agent_failure(ctx)
+        _check_and_trigger_troubleshooter(
+            "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
+            ctx.consecutive_failures, ctx, self._context_path,
+        )
+        return "impl_done"
 
 
 class ValidateStep(Step):
@@ -632,13 +664,35 @@ class ValidateStep(Step):
 
     _PENDING_KEY = "validate"
 
-    def __init__(self, context_path: Path, log_dir: Path) -> None:
+    def __init__(self, ctx: "PipelineContext", context_path: Path, log_dir: Path) -> None:
+        self._ctx = ctx
         self._context_path = context_path
         self._log_dir = log_dir
 
-    def run(self, ctx: PipelineContext) -> str:
+    def get_actions(self) -> list[dict]:
+        ctx = self._ctx
         if ctx.validate_result:
-            # Re-entry: script-runner has written the result.
+            return []
+        self._log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+        log_path = self._log_dir / f"{ctx.work_item_id}-validate-{timestamp}.log"
+        ctx.build_log = str(log_path)
+        ext = ".cmd" if sys.platform == "win32" else ".sh"
+        validate_script = REPO_ROOT / "scripts" / f"validate{ext}"
+        command = f'cmd /c "{validate_script}"' if sys.platform == "win32" else f'bash "{validate_script}"'
+        print(f"Spawning script-runner to validate {ctx.work_item_id}...", flush=True)
+        return [{
+            "action": "run_script",
+            "message": "Running build and test validation.",
+            "command": command,
+            "log_file": str(log_path),
+            "write_section": "Validate Result",
+            "result_format": "passed | failed",
+        }]
+
+    def handle_results(self, results: list[str]) -> str:
+        ctx = self._ctx
+        if ctx.validate_result:
             result = ctx.validate_result.strip()
             ctx.validate_result = ""
             ctx.pending_agent = ""
@@ -653,34 +707,19 @@ class ValidateStep(Step):
                 f"Full log (read this for details): {ctx.build_log}"
             )
             return "build_failed"
+        # Script-runner ran but wrote nothing
+        _handle_agent_failure(ctx)
+        _check_and_trigger_troubleshooter(
+            "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
+            ctx.consecutive_failures, ctx, self._context_path,
+        )
+        return "build_failed"
 
-        if ctx.pending_agent == self._PENDING_KEY:
-            # Re-entry with no result — script-runner failed to write outcome.
-            _handle_agent_failure(ctx)
-            _check_and_trigger_troubleshooter(
-                "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
-                ctx.consecutive_failures, ctx, self._context_path,
-            )
 
-        self._log_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
-        log_path = self._log_dir / f"{ctx.work_item_id}-validate-{timestamp}.log"
-        ctx.build_log = str(log_path)
-        ctx.pending_agent = self._PENDING_KEY
-        ctx.save(self._context_path)
-
-        ext = ".cmd" if sys.platform == "win32" else ".sh"
-        validate_script = REPO_ROOT / "scripts" / f"validate{ext}"
-        command = f'cmd /c "{validate_script}"' if sys.platform == "win32" else f'bash "{validate_script}"'
-        print(f"Spawning script-runner to validate {ctx.work_item_id}...", flush=True)
-        exit_with_actions([{
-            "action": "run_script",
-            "message": "Running build and test validation.",
-            "command": command,
-            "log_file": str(log_path),
-            "write_section": "Validate Result",
-            "result_format": "passed | failed",
-        }])
+_REDISPATCH = "_redispatch"
+"""Sentinel trigger returned by handle_results() when the step needs another dispatch
+round before a final trigger can be produced. The pipeline loop handles this by calling
+get_actions() again on the same step without advancing the state machine."""
 
 
 class ReviewStep(Step):
@@ -689,39 +728,19 @@ class ReviewStep(Step):
     _PENDING_CREATE_PR = "create-pr"
     _PENDING_REVIEW = "reviewer-review"
 
-    def __init__(self, context_path: Path) -> None:
+    def __init__(self, ctx: "PipelineContext", context_path: Path) -> None:
+        self._ctx = ctx
         self._context_path = context_path
 
-    def run(self, ctx: PipelineContext) -> str:
+    def get_actions(self) -> list[dict]:
+        ctx = self._ctx
         # Sub-step 1: create PR
-        if not ctx.pr_url:
-            if ctx.pending_agent == self._PENDING_CREATE_PR:
-                # Re-entry: try to extract pr_url written to the "PR URL" section.
-                text = self._context_path.read_text(encoding="utf-8")
-                _, body = _parse_frontmatter(text)
-                sections = _parse_sections(body)
-                pr_url_section = sections.get("PR URL", "")
-                if pr_url_section:
-                    m = re.search(r"https://github\.com/[^\s]+/pull/\d+", pr_url_section)
-                    if m:
-                        ctx.pr_url = m.group(0)
-                        ctx.save(self._context_path)
-                if not ctx.pr_url:
-                    # Agent ran but pr_url still not populated — treat as failure.
-                    _handle_agent_failure(ctx)
-                    _check_and_trigger_troubleshooter(
-                        "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
-                        ctx.consecutive_failures, ctx, self._context_path,
-                    )
-
         if not ctx.pr_url:
             print(f"Developer is creating PR for {ctx.work_item_id}...", flush=True)
             read_sections = ["Researcher Brief", "Implementation Summary"]
             for i in range(1, len(ctx.work_summaries)):
                 read_sections.append(f"Fix {i}")
-            ctx.pending_agent = self._PENDING_CREATE_PR
-            ctx.save(self._context_path)
-            exit_with_actions([{
+            return [{
                 "action": "spawn_agent",
                 "message": "Implementation complete. Developer is creating a pull request.",
                 "agent": "developer",
@@ -731,29 +750,12 @@ class ReviewStep(Step):
                 "read_sections": read_sections,
                 "write_section": "PR URL",
                 "result_format": "pr_created | failed",
-            }])
-
-        # Sub-step 2: review
+            }]
+        # Sub-step 2: review (or inline if notes already present)
         if ctx.review_notes:
-            _handle_agent_success(ctx)
-            status = _parse_approval_status(ctx.review_notes)
-            if status == "approved":
-                print("Review approved.", flush=True)
-                return "approved"
-            print("Reviewer requested changes.", flush=True)
-            return "changes_requested"
-
-        if ctx.pending_agent == self._PENDING_REVIEW:
-            _handle_agent_failure(ctx)
-            _check_and_trigger_troubleshooter(
-                "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
-                ctx.consecutive_failures, ctx, self._context_path,
-            )
-
+            return []
         print(f"Reviewer is reviewing {ctx.work_item_id}...", flush=True)
-        ctx.pending_agent = self._PENDING_REVIEW
-        ctx.save(self._context_path)
-        exit_with_actions([{
+        return [{
             "action": "spawn_agent",
             "message": "Pull request created. Reviewer is reviewing the changes.",
             "agent": "reviewer",
@@ -762,172 +764,230 @@ class ReviewStep(Step):
             "read_sections": ["Researcher Brief"],
             "write_section": "Review Notes",
             "result_format": "approved | changes_requested",
-        }])
+        }]
+
+    def handle_results(self, results: list[str]) -> str:
+        ctx = self._ctx
+        if not ctx.pr_url:
+            # Just ran create-PR — try to extract pr_url
+            text = self._context_path.read_text(encoding="utf-8")
+            _, body = _parse_frontmatter(text)
+            sections = _parse_sections(body)
+            pr_url_section = sections.get("PR URL", "")
+            if pr_url_section:
+                m = re.search(r"https://github\.com/[^\s]+/pull/\d+", pr_url_section)
+                if m:
+                    ctx.pr_url = m.group(0)
+                    ctx.save(self._context_path)
+            if not ctx.pr_url:
+                _handle_agent_failure(ctx)
+                _check_and_trigger_troubleshooter(
+                    "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
+                    ctx.consecutive_failures, ctx, self._context_path,
+                )
+            # Signal the loop to dispatch again (review sub-step) before transitioning
+            return _REDISPATCH
+
+        # Review sub-step result
+        if ctx.review_notes:
+            _handle_agent_success(ctx)
+            status = _parse_approval_status(ctx.review_notes)
+            if status == "approved":
+                print("Review approved.", flush=True)
+                return "approved"
+            print("Reviewer requested changes.", flush=True)
+            return "changes_requested"
+        _handle_agent_failure(ctx)
+        _check_and_trigger_troubleshooter(
+            "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
+            ctx.consecutive_failures, ctx, self._context_path,
+        )
+        return "changes_requested"
 
 
-class SignoffStep(Step):
-    handles = "signoff"
+class ParallelSteps(Step):
+    """Composite step that dispatches multiple child steps in parallel.
 
-    _PENDING_REVIEWER = "signoff-reviewer"
-    _PENDING_RESEARCHER = "signoff-researcher"
-    _PENDING_PARALLEL = "signoff-parallel"
+    get_actions() concatenates all children's actions into a single flat list.
+    handle_results() splits results by each child's action count, calls each
+    child's handle_results(), and passes the resulting monikers to combine_results().
+    """
 
-    def __init__(self, context_path: Path, log_dir: Path) -> None:
+    def __init__(self, steps: list["Step"]) -> None:
+        self._steps = steps
+        self._action_counts: list[int] = []
+
+    def get_actions(self) -> list[dict]:
+        all_actions: list[dict] = []
+        self._action_counts = []
+        for step in self._steps:
+            actions = step.get_actions()
+            self._action_counts.append(len(actions))
+            all_actions.extend(actions)
+        return all_actions
+
+    def handle_results(self, results: list[str]) -> str:
+        child_monikers: list[str] = []
+        offset = 0
+        for step, count in zip(self._steps, self._action_counts):
+            child_results = results[offset: offset + count]
+            offset += count
+            moniker = step.handle_results(child_results)
+            child_monikers.append(moniker)
+        return self.combine_results(child_monikers)
+
+    def combine_results(self, child_monikers: list[str]) -> str:
+        """Combine child monikers: 'failed' > 'changes_requested' > first moniker."""
+        if "failed" in child_monikers:
+            return "failed"
+        if "changes_requested" in child_monikers:
+            return "changes_requested"
+        return child_monikers[0] if child_monikers else "approved"
+
+
+class ReviewerSignOffStep(Step):
+    """Wraps the reviewer-sign-off spawn for use inside ParallelSteps."""
+
+    def __init__(self, ctx: "PipelineContext", context_path: Path) -> None:
+        self._ctx = ctx
+        self._context_path = context_path
+
+    def get_actions(self) -> list[dict]:
+        return [{
+            "action": "spawn_agent",
+            "agent": "task-runner",
+            "skill": "reviewer-sign-off",
+            "context_file": str(self._context_path),
+            "read_sections": ["Researcher Brief"],
+            "write_section": "Signoff Review",
+            "result_format": "approved | changes_requested",
+        }]
+
+    def handle_results(self, results: list[str]) -> str:
+        ctx = self._ctx
+        if ctx.signoff_review:
+            _handle_agent_success(ctx)
+            return _parse_approval_status(ctx.signoff_review)
+        _handle_agent_failure(ctx)
+        _check_and_trigger_troubleshooter(
+            "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
+            ctx.consecutive_failures, ctx, self._context_path,
+        )
+        return "changes_requested"
+
+
+class ResearcherSignOffStep(Step):
+    """Wraps the researcher-validate spawn for use inside ParallelSteps."""
+
+    def __init__(self, ctx: "PipelineContext", context_path: Path) -> None:
+        self._ctx = ctx
+        self._context_path = context_path
+
+    def get_actions(self) -> list[dict]:
+        ctx = self._ctx
+        read_sections = ["Researcher Brief", "Implementation Summary"]
+        for i in range(1, len(ctx.work_summaries)):
+            read_sections.append(f"Fix {i}")
+        return [{
+            "action": "spawn_agent",
+            "agent": "task-runner",
+            "skill": "researcher-validate",
+            "context_file": str(self._context_path),
+            "read_sections": read_sections,
+            "write_section": "Signoff Research",
+            "result_format": "validated | failed",
+        }]
+
+    def handle_results(self, results: list[str]) -> str:
+        ctx = self._ctx
+        if ctx.signoff_research:
+            _handle_agent_success(ctx)
+            return "approved" if _researcher_validated(ctx.signoff_research) else "failed"
+        _handle_agent_failure(ctx)
+        _check_and_trigger_troubleshooter(
+            "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
+            ctx.consecutive_failures, ctx, self._context_path,
+        )
+        return "failed"
+
+
+class BuildValidationStep(Step):
+    """Wraps the wait-pr-checks run_script for use inside ParallelSteps."""
+
+    def __init__(self, ctx: "PipelineContext", context_path: Path, log_dir: Path) -> None:
+        self._ctx = ctx
         self._context_path = context_path
         self._log_dir = log_dir
 
-    def _make_run_script_descriptor(self, ctx: PipelineContext) -> dict:
-        """Build a run_script descriptor that waits for PR checks to complete."""
+    def get_actions(self) -> list[dict]:
+        ctx = self._ctx
         self._log_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
         log_path = self._log_dir / f"{ctx.work_item_id}-signoff-{timestamp}.log"
         ctx.build_log = str(log_path)
-
         scripts_dir = Path(__file__).parent
         wait_script = scripts_dir / "wait-pr-checks.sh"
         command = f'bash "{wait_script}" "{ctx.pr_url}"'
-
-        return {
+        return [{
             "action": "run_script",
             "command": command,
             "log_file": str(log_path),
             "write_section": "Signoff Build Result",
             "result_format": "passed | failed",
-        }
+        }]
 
-    def run(self, ctx: PipelineContext) -> str:
+    def handle_results(self, results: list[str]) -> str:
+        ctx = self._ctx
+        if ctx.signoff_build_result:
+            _handle_agent_success(ctx)
+            return "approved" if ctx.signoff_build_result.strip().startswith("passed") else "failed"
+        _handle_agent_failure(ctx)
+        _check_and_trigger_troubleshooter(
+            "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
+            ctx.consecutive_failures, ctx, self._context_path,
+        )
+        return "failed"
+
+
+class SignoffStep(ParallelSteps):
+    handles = "signoff"
+
+    def __init__(self, ctx: "PipelineContext", context_path: Path, log_dir: Path) -> None:
+        self._ctx = ctx
+        self._context_path = context_path
+        self._log_dir = log_dir
+        super().__init__([
+            ReviewerSignOffStep(ctx, context_path),
+            ResearcherSignOffStep(ctx, context_path),
+            BuildValidationStep(ctx, context_path, log_dir),
+        ])
+
+    def get_actions(self) -> list[dict]:
+        ctx = self._ctx
         # Push first so the reviewer can see the latest commits.
         _commit_and_push(ctx.work_item_id)
+        print(f"Spawning reviewer, researcher, and build/test in parallel for "
+              f"{ctx.work_item_id}...", flush=True)
+        return super().get_actions()
 
-        # Sub-step 1, 2 & 3: spawn reviewer, researcher, and build/test script in parallel.
-        if not ctx.signoff_review and not ctx.signoff_research:
-            if ctx.pending_agent in (self._PENDING_REVIEWER, self._PENDING_RESEARCHER,
-                                     self._PENDING_PARALLEL):
-                # Re-entry after parallel spawn with no results — treat as failure.
-                _handle_agent_failure(ctx)
-                _check_and_trigger_troubleshooter(
-                    "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
-                    ctx.consecutive_failures, ctx, self._context_path,
-                )
+    def handle_results(self, results: list[str]) -> str:
+        ctx = self._ctx
+        trigger = super().handle_results(results)
 
-            print(f"Spawning reviewer, researcher, and build/test in parallel for "
-                  f"{ctx.work_item_id}...", flush=True)
-            read_sections_researcher = ["Researcher Brief", "Implementation Summary"]
-            for i in range(1, len(ctx.work_summaries)):
-                read_sections_researcher.append(f"Fix {i}")
-            run_script_desc = self._make_run_script_descriptor(ctx)
-            ctx.pending_agent = self._PENDING_PARALLEL
-            ctx.save(self._context_path)
-            exit_with_actions([
-                {
-                    "action": "spawn_agent",
-                    "agent": "task-runner",
-                    "skill": "reviewer-sign-off",
-                    "context_file": str(self._context_path),
-                    "read_sections": ["Researcher Brief"],
-                    "write_section": "Signoff Review",
-                    "result_format": "approved | changes_requested",
-                },
-                {
-                    "action": "spawn_agent",
-                    "agent": "task-runner",
-                    "skill": "researcher-validate",
-                    "context_file": str(self._context_path),
-                    "read_sections": read_sections_researcher,
-                    "write_section": "Signoff Research",
-                    "result_format": "validated | failed",
-                },
-                run_script_desc,
-            ])
-
-        # Sub-step 1: reviewer sign-off (sequential fallback: only reviewer missing)
-        if not ctx.signoff_review:
-            if ctx.pending_agent == self._PENDING_REVIEWER:
-                _handle_agent_failure(ctx)
-                _check_and_trigger_troubleshooter(
-                    "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
-                    ctx.consecutive_failures, ctx, self._context_path,
-                )
-
-            print(f"Reviewer is signing off {ctx.work_item_id}...", flush=True)
-            ctx.pending_agent = self._PENDING_REVIEWER
-            ctx.save(self._context_path)
-            exit_with_actions([{
-                "action": "spawn_agent",
-                "message": "Researcher validated. Reviewer is performing final sign-off.",
-                "agent": "task-runner",
-                "skill": "reviewer-sign-off",
-                "context_file": str(self._context_path),
-                "read_sections": ["Researcher Brief"],
-                "write_section": "Signoff Review",
-                "result_format": "approved | changes_requested",
-            }])
-
-        # signoff_review is populated — reviewer agent succeeded
-        _handle_agent_success(ctx)
-
-        # Sub-step 2: researcher validate (sequential fallback: only researcher missing)
-        if not ctx.signoff_research:
-            if ctx.pending_agent == self._PENDING_RESEARCHER:
-                _handle_agent_failure(ctx)
-                _check_and_trigger_troubleshooter(
-                    "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
-                    ctx.consecutive_failures, ctx, self._context_path,
-                )
-
-            print(f"Researcher is validating {ctx.work_item_id}...", flush=True)
-            read_sections = ["Researcher Brief", "Implementation Summary"]
-            for i in range(1, len(ctx.work_summaries)):
-                read_sections.append(f"Fix {i}")
-            ctx.pending_agent = self._PENDING_RESEARCHER
-            ctx.save(self._context_path)
-            exit_with_actions([{
-                "action": "spawn_agent",
-                "message": "Reviewer signed off. Researcher is validating exit criteria.",
-                "agent": "task-runner",
-                "skill": "researcher-validate",
-                "context_file": str(self._context_path),
-                "read_sections": read_sections,
-                "write_section": "Signoff Research",
-                "result_format": "validated | failed",
-            }])
-
-        # Both review and research are populated — both agents succeeded
-        _handle_agent_success(ctx)
-
-        # Sub-step 3: build/test script (sequential fallback: build result missing)
-        if not ctx.signoff_build_result:
-            pending_key = "signoff-build"
-            if ctx.pending_agent == pending_key:
-                _handle_agent_failure(ctx)
-                _check_and_trigger_troubleshooter(
-                    "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
-                    ctx.consecutive_failures, ctx, self._context_path,
-                )
-
-            print(f"Running build/test validation for {ctx.work_item_id}...", flush=True)
-            run_script_desc = self._make_run_script_descriptor(ctx)
-            ctx.pending_agent = pending_key
-            ctx.save(self._context_path)
-            exit_with_actions([run_script_desc])
-
-        # All three results available — process them
+        # Build the failure summary for downstream steps
         failures: list[str] = []
-
-        build_passed = ctx.signoff_build_result.strip().startswith("passed")
-        if not build_passed:
-            failures.append(
-                f"Build/test validation failed. Log: {ctx.build_log}\n"
-                f"Script result: {ctx.signoff_build_result.strip()}"
-            )
-
-        reviewer_approved = _parse_approval_status(ctx.signoff_review) == "approved"
-        if not reviewer_approved:
-            failures.append(f"Reviewer sign-off:\n{ctx.signoff_review}")
-
-        researcher_ok = _researcher_validated(ctx.signoff_research)
-        if not researcher_ok:
-            failures.append(f"Research validation:\n{ctx.signoff_research}")
+        if not ctx.signoff_build_result.strip().startswith("passed"):
+            if ctx.signoff_build_result:
+                failures.append(
+                    f"Build/test validation failed. Log: {ctx.build_log}\n"
+                    f"Script result: {ctx.signoff_build_result.strip()}"
+                )
+        if _parse_approval_status(ctx.signoff_review) != "approved":
+            if ctx.signoff_review:
+                failures.append(f"Reviewer sign-off:\n{ctx.signoff_review}")
+        if not _researcher_validated(ctx.signoff_research):
+            if ctx.signoff_research:
+                failures.append(f"Research validation:\n{ctx.signoff_research}")
 
         # Reset sub-step sections for the next signoff cycle
         ctx.signoff_review = ""
@@ -935,8 +995,8 @@ class SignoffStep(Step):
         ctx.signoff_build_result = ""
         ctx.pending_agent = ""
 
-        if failures:
-            ctx.review_notes = "\n\n---\n\n".join(failures)
+        if failures or trigger != "approved":
+            ctx.review_notes = "\n\n---\n\n".join(failures) if failures else "Signoff failed."
             ctx.last_failure = ctx.review_notes
             print("Signoff found issues; requesting further changes.", flush=True)
             return "changes_requested"
@@ -945,39 +1005,29 @@ class SignoffStep(Step):
         print("Signoff approved.", flush=True)
         return "approved"
 
+    def combine_results(self, child_monikers: list[str]) -> str:
+        """Signoff: 'failed' > 'changes_requested' > 'approved'."""
+        if "failed" in child_monikers:
+            return "failed"
+        if "changes_requested" in child_monikers:
+            return "changes_requested"
+        return "approved"
+
 
 class FixStep(Step):
     handles = "fixing"
 
-    def __init__(self, context_path: Path) -> None:
+    def __init__(self, ctx: "PipelineContext", context_path: Path) -> None:
+        self._ctx = ctx
         self._context_path = context_path
 
-    def run(self, ctx: PipelineContext) -> str:
-        # Total completed fix summaries before this step runs
+    def get_actions(self) -> list[dict]:
+        ctx = self._ctx
         completed = 1 + ctx.fix_iteration + ctx.review_fix_iteration
-        pending_key = f"fix-{completed}"
-
         if len(ctx.work_summaries) > completed:
-            # Fix agent wrote a new summary since last iteration
-            _handle_agent_success(ctx)
-            ctx.fix_iteration += 1
-            return "fix_done"
-
+            return []
         if ctx.fix_iteration >= MAX_FIX_ITERATIONS:
-            print(
-                f"Error: still failing after {MAX_FIX_ITERATIONS} fix iterations. "
-                f"Manual intervention needed.",
-                file=sys.stderr,
-            )
-            return "max_retries"
-
-        if ctx.pending_agent == pending_key:
-            _handle_agent_failure(ctx)
-            _check_and_trigger_troubleshooter(
-                "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
-                ctx.consecutive_failures, ctx, self._context_path,
-            )
-
+            return []
         write_section = f"Fix {completed}"
         print(
             f"Invoking developer to fix "
@@ -989,10 +1039,7 @@ class FixStep(Step):
             read_sections.append("Implementation Summary")
         for i in range(1, len(ctx.work_summaries)):
             read_sections.append(f"Fix {i}")
-
-        ctx.pending_agent = pending_key
-        ctx.save(self._context_path)
-        exit_with_actions([{
+        return [{
             "action": "spawn_agent",
             "message": (
                 f"Build or tests failed. Developer is fixing "
@@ -1005,40 +1052,44 @@ class FixStep(Step):
             "read_sections": read_sections,
             "write_section": write_section,
             "result_format": "fixed | failed",
-        }])
+        }]
+
+    def handle_results(self, results: list[str]) -> str:
+        ctx = self._ctx
+        completed = 1 + ctx.fix_iteration + ctx.review_fix_iteration
+        if len(ctx.work_summaries) > completed:
+            _handle_agent_success(ctx)
+            ctx.fix_iteration += 1
+            return "fix_done"
+        if ctx.fix_iteration >= MAX_FIX_ITERATIONS:
+            print(
+                f"Error: still failing after {MAX_FIX_ITERATIONS} fix iterations. "
+                f"Manual intervention needed.",
+                file=sys.stderr,
+            )
+            return "max_retries"
+        _handle_agent_failure(ctx)
+        _check_and_trigger_troubleshooter(
+            "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
+            ctx.consecutive_failures, ctx, self._context_path,
+        )
+        return "fix_done"
 
 
 class FixPrStep(Step):
     handles = "fixing-pr"
 
-    def __init__(self, context_path: Path) -> None:
+    def __init__(self, ctx: "PipelineContext", context_path: Path) -> None:
+        self._ctx = ctx
         self._context_path = context_path
 
-    def run(self, ctx: PipelineContext) -> str:
+    def get_actions(self) -> list[dict]:
+        ctx = self._ctx
         completed = 1 + ctx.fix_iteration + ctx.review_fix_iteration
-        pending_key = f"fix-pr-{completed}"
-
         if len(ctx.work_summaries) > completed:
-            _handle_agent_success(ctx)
-            ctx.review_fix_iteration += 1
-            ctx.review_notes = ""  # ensure ReviewStep re-runs reviewer on next cycle
-            return "fix_done"
-
+            return []
         if ctx.review_fix_iteration >= MAX_REVIEW_FIX_ITERATIONS:
-            print(
-                f"Error: still failing review after {MAX_REVIEW_FIX_ITERATIONS} "
-                f"review fix iterations. Manual intervention needed.",
-                file=sys.stderr,
-            )
-            return "max_retries"
-
-        if ctx.pending_agent == pending_key:
-            _handle_agent_failure(ctx)
-            _check_and_trigger_troubleshooter(
-                "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
-                ctx.consecutive_failures, ctx, self._context_path,
-            )
-
+            return []
         write_section = f"Fix {completed}"
         print(
             f"Invoking developer to address review comments "
@@ -1048,9 +1099,7 @@ class FixPrStep(Step):
         read_sections = ["Researcher Brief", "Review Notes", "Implementation Summary"]
         for i in range(1, len(ctx.work_summaries)):
             read_sections.append(f"Fix {i}")
-
-        # When a PR exists, include failing GitHub Actions check output in the fix context
-        # instead of running validate scripts in-process.
+        # When a PR exists, include failing GitHub Actions check output
         if ctx.pr_url:
             pr_checks_output = _get_failing_pr_checks(ctx.pr_url)
             if pr_checks_output:
@@ -1058,10 +1107,7 @@ class FixPrStep(Step):
                     f"{ctx.review_notes}\n\n"
                     f"Failing GitHub Actions checks:\n```\n{pr_checks_output}\n```"
                 )
-
-        ctx.pending_agent = pending_key
-        ctx.save(self._context_path)
-        exit_with_actions([{
+        return [{
             "action": "spawn_agent",
             "message": (
                 f"Review requested changes. Developer is addressing review comments "
@@ -1074,7 +1120,29 @@ class FixPrStep(Step):
             "read_sections": read_sections,
             "write_section": write_section,
             "result_format": "fixed | failed",
-        }])
+        }]
+
+    def handle_results(self, results: list[str]) -> str:
+        ctx = self._ctx
+        completed = 1 + ctx.fix_iteration + ctx.review_fix_iteration
+        if len(ctx.work_summaries) > completed:
+            _handle_agent_success(ctx)
+            ctx.review_fix_iteration += 1
+            ctx.review_notes = ""  # ensure ReviewStep re-runs reviewer on next cycle
+            return "fix_done"
+        if ctx.review_fix_iteration >= MAX_REVIEW_FIX_ITERATIONS:
+            print(
+                f"Error: still failing review after {MAX_REVIEW_FIX_ITERATIONS} "
+                f"review fix iterations. Manual intervention needed.",
+                file=sys.stderr,
+            )
+            return "max_retries"
+        _handle_agent_failure(ctx)
+        _check_and_trigger_troubleshooter(
+            "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
+            ctx.consecutive_failures, ctx, self._context_path,
+        )
+        return "fix_done"
 
 
 # ---------------------------------------------------------------------------
@@ -1091,23 +1159,69 @@ class DevTeamPipeline:
         log_dir: Path,
         workflow: WorkflowDefinition,
         research_skill: str,
+        results: list[str] | None = None,
     ) -> None:
         self.ctx = ctx
         self.context_path = context_path
         self.log_dir = log_dir
         self.workflow = workflow
+        self.results = results  # pre-parsed --results list, or None
         self.machine = StateMachine(workflow.transitions, initial=ctx.state)
         self.step_handlers: dict[str, Step] = {
-            "spec-finding": FindSpecStep(),
-            "debugging": DebugStep(context_path),
-            "researching": ResearchStep(research_skill, context_path),
-            "implementing": ImplementStep(context_path),
-            "validating": ValidateStep(context_path, log_dir),
-            "fixing": FixStep(context_path),
-            "reviewing": ReviewStep(context_path),
-            "signoff": SignoffStep(context_path, log_dir),
-            "fixing-pr": FixPrStep(context_path),
+            "spec-finding": FindSpecStep(ctx),
+            "debugging": DebugStep(ctx, context_path),
+            "researching": ResearchStep(research_skill, ctx, context_path),
+            "implementing": ImplementStep(ctx, context_path),
+            "validating": ValidateStep(ctx, context_path, log_dir),
+            "fixing": FixStep(ctx, context_path),
+            "reviewing": ReviewStep(ctx, context_path),
+            "signoff": SignoffStep(ctx, context_path, log_dir),
+            "fixing-pr": FixPrStep(ctx, context_path),
         }
+
+    def _dispatch_step(self, step: Step) -> str:
+        """Dispatch a step: get actions, exit if non-empty, else return trigger inline.
+
+        If results are available (--results provided), call handle_results() instead
+        of exiting.
+
+        Returns the trigger string once the step has fully resolved. For _REDISPATCH,
+        loops until a real trigger is obtained.
+        """
+        # If --results provided on this invocation, process them for the current step
+        if self.results is not None:
+            results = self.results
+            self.results = None  # consume once
+            trigger = step.handle_results(results)
+            if trigger == _REDISPATCH:
+                # Need another dispatch round — get_actions() returns the next batch
+                return self._do_get_actions_and_exit(step)
+            return trigger
+
+        # No results yet — check for inline step or dispatch
+        return self._do_get_actions_and_exit(step)
+
+    def _do_get_actions_and_exit(self, step: Step) -> str:
+        """Call get_actions(); exit if non-empty; otherwise call handle_results([])."""
+        actions = step.get_actions()
+        if actions:
+            self.ctx.pending_agent = _step_pending_key(step)
+            self.ctx.save(self.context_path)
+            exit_with_actions(actions)
+        # Inline step
+        trigger = step.handle_results([])
+        if trigger == _REDISPATCH:
+            # After inline results, need another dispatch
+            actions2 = step.get_actions()
+            if not actions2:
+                raise RuntimeError(
+                    f"Inline step {type(step).__name__} returned {_REDISPATCH!r} but "
+                    "get_actions() still returns [] — infinite loop guard triggered."
+                )
+            self.ctx.pending_agent = _step_pending_key(step)
+            self.ctx.save(self.context_path)
+            exit_with_actions(actions2)
+        return trigger
 
     def run(self) -> None:
         if self.machine.state == self.workflow.initial_state:
@@ -1131,7 +1245,7 @@ class DevTeamPipeline:
                 }])
 
             current_state = self.machine.state
-            trigger = step.run(self.ctx)
+            trigger = self._dispatch_step(step)
 
             _apply_counter_updates(self.ctx, current_state, trigger)
 
@@ -1164,6 +1278,15 @@ class DevTeamPipeline:
                 "result": "failed",
                 "reason": f"Pipeline ended in state '{self.machine.state}' for {self.ctx.work_item_id}",
             }])
+
+
+def _step_pending_key(step: Step) -> str:
+    """Return the pending_agent key for a step, falling back to handles."""
+    if hasattr(step, "_PENDING_KEY"):
+        return step._PENDING_KEY  # type: ignore[attr-defined]
+    if hasattr(step, "handles"):
+        return step.handles
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -1294,6 +1417,8 @@ def main() -> None:
                         help="Path to the pipeline context file (computed by dev-team.md)")
     parser.add_argument("--print-context-path", metavar="repo-slug", default=None,
                         help="Print the context file path for the given repo slug and exit")
+    parser.add_argument("--results", metavar="results", default=None,
+                        help="Comma-separated one-line results from the previous parallel dispatch")
     args = parser.parse_args()
 
     # --print-context-path mode: compute and print the context file path, then exit.
@@ -1342,7 +1467,15 @@ def main() -> None:
         ctx = PipelineContext(work_item_id=work_item_id, state=workflow.initial_state)
         ctx.save(context_path)
 
-    DevTeamPipeline(ctx, context_path, log_dir, workflow, research_skill=args.research_skill).run()
+    results: list[str] | None = None
+    if args.results is not None:
+        results = [r.strip() for r in args.results.split(",")]
+
+    DevTeamPipeline(
+        ctx, context_path, log_dir, workflow,
+        research_skill=args.research_skill,
+        results=results,
+    ).run()
 
 
 if __name__ == "__main__":

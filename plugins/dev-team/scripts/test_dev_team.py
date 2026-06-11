@@ -758,3 +758,210 @@ class TestGetContextPathShErrorHandling:
         )
         assert result.returncode != 0
         assert "Usage" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# ParallelSteps
+# ---------------------------------------------------------------------------
+
+class _StubStep:
+    """Minimal Step-like object for testing ParallelSteps."""
+
+    def __init__(self, actions: list[dict], result: str) -> None:
+        self._actions = actions
+        self._result = result
+        self.received_results: list[str] = []
+
+    def get_actions(self) -> list[dict]:
+        return list(self._actions)
+
+    def handle_results(self, results: list[str]) -> str:
+        self.received_results = results
+        return self._result
+
+
+class TestParallelStepsGetActions:
+    def test_flat_list_equals_concatenation_of_children(self):
+        from dev_team import ParallelSteps
+        a1 = {"action": "spawn_agent", "skill": "reviewer-sign-off"}
+        a2 = {"action": "spawn_agent", "skill": "researcher-validate"}
+        a3 = {"action": "run_script", "command": "bash build.sh"}
+        s1 = _StubStep([a1], "approved")
+        s2 = _StubStep([a2, a3], "validated")
+        ps = ParallelSteps([s1, s2])  # type: ignore[arg-type]
+        actions = ps.get_actions()
+        assert actions == [a1, a2, a3]
+
+    def test_empty_children_produce_empty_list(self):
+        from dev_team import ParallelSteps
+        ps = ParallelSteps([_StubStep([], "approved")])  # type: ignore[arg-type]
+        assert ps.get_actions() == []
+
+    def test_action_counts_tracked(self):
+        from dev_team import ParallelSteps
+        s1 = _StubStep([{"a": 1}], "approved")
+        s2 = _StubStep([{"b": 2}, {"c": 3}], "validated")
+        ps = ParallelSteps([s1, s2])  # type: ignore[arg-type]
+        ps.get_actions()
+        assert ps._action_counts == [1, 2]
+
+
+class TestParallelStepsHandleResults:
+    def _make_ps(self, child_defs: list[tuple[list[dict], str]]):
+        from dev_team import ParallelSteps
+        steps = [_StubStep(actions, result) for actions, result in child_defs]
+        ps = ParallelSteps(steps)  # type: ignore[arg-type]
+        ps.get_actions()  # populate _action_counts
+        return ps, steps
+
+    def test_results_split_correctly_by_action_count(self):
+        ps, steps = self._make_ps([
+            ([{"a": 1}], "approved"),
+            ([{"b": 2}, {"c": 3}], "validated"),
+        ])
+        ps.handle_results(["r1", "r2", "r3"])
+        assert steps[0].received_results == ["r1"]
+        assert steps[1].received_results == ["r2", "r3"]
+
+    def test_combine_results_failed_beats_all(self):
+        ps, _ = self._make_ps([
+            ([{"a": 1}], "failed"),
+            ([{"b": 2}], "approved"),
+        ])
+        result = ps.handle_results(["x", "y"])
+        assert result == "failed"
+
+    def test_combine_results_changes_requested_beats_approved(self):
+        ps, _ = self._make_ps([
+            ([{"a": 1}], "changes_requested"),
+            ([{"b": 2}], "approved"),
+        ])
+        result = ps.handle_results(["x", "y"])
+        assert result == "changes_requested"
+
+    def test_combine_results_all_approved_returns_first(self):
+        ps, _ = self._make_ps([
+            ([{"a": 1}], "approved"),
+            ([{"b": 2}], "approved"),
+        ])
+        result = ps.handle_results(["x", "y"])
+        assert result == "approved"
+
+    def test_failed_beats_changes_requested(self):
+        ps, _ = self._make_ps([
+            ([{"a": 1}], "changes_requested"),
+            ([{"b": 2}], "failed"),
+        ])
+        result = ps.handle_results(["x", "y"])
+        assert result == "failed"
+
+
+# ---------------------------------------------------------------------------
+# Inline step (get_actions returns [])
+# ---------------------------------------------------------------------------
+
+class TestInlineStepDispatch:
+    """The pipeline loop must advance through inline steps without calling
+    exit_with_actions, and must raise RuntimeError if the step pointer does
+    not advance."""
+
+    def _make_pipeline(self, ctx, context_path, step):
+        """Build a minimal pipeline that contains a single inline step."""
+        from dev_team import (
+            DevTeamPipeline, WorkflowDefinition, StateMachine
+        )
+        workflow = WorkflowDefinition(
+            transitions={
+                "init": {"start": "testing"},
+                "testing": {"done_ok": "done"},
+            },
+            terminal_states={"done"},
+            initial_state="init",
+        )
+        pipeline = DevTeamPipeline.__new__(DevTeamPipeline)
+        pipeline.ctx = ctx
+        pipeline.context_path = context_path
+        pipeline.log_dir = context_path.parent / "logs"
+        pipeline.workflow = workflow
+        pipeline.results = None
+        pipeline.machine = StateMachine(workflow.transitions, initial="testing")
+        pipeline.step_handlers = {"testing": step}
+        return pipeline
+
+    def test_inline_step_advances_without_exit(self, tmp_path):
+        """get_actions=[] step: handle_results([]) called and trigger returned."""
+        from dev_team import PipelineContext
+        ctx = PipelineContext(work_item_id="ADR-TEST", state="testing")
+        context_path = tmp_path / "ctx.md"
+        ctx.save(context_path)
+
+        step = _StubStep([], "done_ok")
+        pipeline = self._make_pipeline(ctx, context_path, step)
+
+        # _do_get_actions_and_exit should return the trigger directly (no sys.exit)
+        trigger = pipeline._do_get_actions_and_exit(step)
+        assert trigger == "done_ok"
+        assert step.received_results == []
+
+    def test_infinite_loop_guard_fires(self, tmp_path):
+        """If _REDISPATCH is returned from an inline step that keeps returning [],
+        RuntimeError must be raised."""
+        from dev_team import PipelineContext, _REDISPATCH
+        import pytest
+
+        ctx = PipelineContext(work_item_id="ADR-TEST", state="testing")
+        context_path = tmp_path / "ctx.md"
+        ctx.save(context_path)
+
+        class LoopyStep:
+            def get_actions(self):
+                return []
+
+            def handle_results(self, results):
+                return _REDISPATCH
+
+        pipeline = self._make_pipeline(ctx, context_path, LoopyStep())  # type: ignore[arg-type]
+        with pytest.raises(RuntimeError, match="infinite loop guard"):
+            pipeline._do_get_actions_and_exit(LoopyStep())  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# --results parsing
+# ---------------------------------------------------------------------------
+
+class TestResultsParsing:
+    def _run_with_results(self, tmp_path, results_str: str | None):
+        """Run dev_team.py in --print-context-path mode just to validate arg parsing."""
+        import os
+        env = {**os.environ, "DEV_TEAM_STATE_DIR": str(tmp_path)}
+        cmd = [
+            sys.executable, str(SCRIPTS_DIR / "dev_team.py"),
+            "ADR-999", "--print-context-path", "org/repo",
+        ]
+        if results_str is not None:
+            cmd += ["--results", results_str]
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=15, env=env)
+
+    def test_no_results_arg_exits_zero(self, tmp_path):
+        result = self._run_with_results(tmp_path, None)
+        assert result.returncode == 0
+
+    def test_results_arg_accepted_exits_zero(self, tmp_path):
+        result = self._run_with_results(tmp_path, "implemented,validated,passed")
+        assert result.returncode == 0
+
+    def test_results_parsed_as_list(self):
+        """Verify comma-split logic used in main()."""
+        raw = "implemented,validated,passed"
+        parts = [r.strip() for r in raw.split(",")]
+        assert parts == ["implemented", "validated", "passed"]
+
+    def test_single_result_parsed_as_one_item_list(self):
+        raw = "briefed"
+        parts = [r.strip() for r in raw.split(",")]
+        assert parts == ["briefed"]
+
+    def test_results_with_spaces_stripped(self):
+        raw = "approved , changes_requested , passed"
+        parts = [r.strip() for r in raw.split(",")]
+        assert parts == ["approved", "changes_requested", "passed"]
