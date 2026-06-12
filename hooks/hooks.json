@@ -1,0 +1,8 @@
+{
+  "hooks": [
+    {
+      "event": "SessionStart",
+      "command": "python \"${CLAUDE_PLUGIN_ROOT}/scripts/dev_team_update.py\" --data-dir \"${CLAUDE_PLUGIN_DATA}\" --threshold-hours 4"
+    }
+  ]
+}
