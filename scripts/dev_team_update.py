@@ -27,7 +27,11 @@ def main() -> None:
         default=4,
         help="Hours between auto-update checks (default: 4)",
     )
-    args = parser.parse_args()
+    try:
+        args = parser.parse_args()
+    except SystemExit:
+        # --help or argument error: do not block session start
+        sys.exit(0)
 
     try:
         data_dir = Path(args.data_dir)
@@ -62,11 +66,29 @@ def main() -> None:
         else:
             plugin_root_path = Path(__file__).parent.parent
 
+        # Skip pull if working tree is dirty (avoids merge conflicts and hangs)
+        git_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        status_result = subprocess.run(
+            ["git", "-C", str(plugin_root_path), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            env=git_env,
+            timeout=30,
+        )
+        if status_result.stdout.strip():
+            print(
+                "[dev_team_update] Skipping auto-update: working tree has local changes.",
+                file=sys.stderr,
+            )
+            return
+
         # Run git pull --ff-only
         result = subprocess.run(
             ["git", "-C", str(plugin_root_path), "pull", "--ff-only", "--quiet"],
             capture_output=True,
             text=True,
+            env=git_env,
+            timeout=30,
         )
 
         if result.returncode != 0:
