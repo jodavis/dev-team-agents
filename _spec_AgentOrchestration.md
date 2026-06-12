@@ -614,6 +614,7 @@ One-time operator configuration required before the pipeline can run. No code ch
 - [ ] `~/.dev-team` added to `permissions.additionalDirectories` in `~/.claude/settings.json` (eliminates per-write permission prompts)
 - [ ] Plugin installation confirmed current (latest changes pulled from `dev-team-agents` repo)
 - [ ] Given `GH_TOKEN` is set to Claude's PAT, when the developer agent runs `gh pr create`, then no account-picker prompt appears
+- [ ] Increment the version in `plugins/dev-team/.claude-plugin/plugin.json` by 0.0.1
 
 ---
 
@@ -627,6 +628,7 @@ Run a full implement pipeline cycle to confirm the step-machine architecture wor
 - [ ] Given a full researcher → developer → reviewer → sign-off cycle, when it completes, then the context file at `~/.dev-team/<repo-slug>/<work-item-id>.md` contains all expected sections and no `claude -p` processes are spawned
 - [ ] Given `GH_TOKEN` is set, when the developer agent creates a PR, then no account-picker prompt appears
 - [ ] Sub-agents (researcher, developer, reviewer) successfully make Jira MCP and GitHub MCP calls directly without top-level relay
+- [ ] Increment the version in `plugins/dev-team/.claude-plugin/plugin.json` by 0.0.1
 
 ---
 
@@ -645,6 +647,7 @@ Implement `agents/troubleshooter.md` with the sign-off deadlock condition as the
 - [ ] Unknown trigger fallback: returns `{"action": "needs_user_input", "reason": "Unknown trigger: <trigger>. Manual inspection required."}`
 - [ ] Writes diagnosis to `<!-- section:Troubleshooter Log -->` before returning in all cases
 - [ ] Given the pipeline has reached `signoff_cycle_count == 2` with a deadlocked thread, when the troubleshooter runs, then it asks the user how to proceed and acts on the answer without re-running the sign-off
+- [ ] Increment the version in `plugins/dev-team/.claude-plugin/plugin.json` by 0.0.1
 
 ## Related Epics
 
