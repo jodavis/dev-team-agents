@@ -7,7 +7,8 @@ stateDiagram-v2
     implementing --> validating : impl_done
     validating --> fixing : build_failed
     validating --> fixing : tests_failed
-    validating --> reviewing : clean
+    validating --> creating-pr : clean
+    creating-pr --> reviewing : pr_created
     reviewing --> done : approved
     reviewing --> fixing-pr : changes_requested
     fixing-pr --> signoff : fix_done
