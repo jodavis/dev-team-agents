@@ -118,6 +118,7 @@ results = await [
   Agent(subagent_type="task-runner", prompt="""
 agent: <item.agent>
 skill: <item.skill>
+plugin_root: <CLAUDE_PLUGIN_ROOT>
 context_file: <item.context_file>
 args: <item.args or "">
 read_sections: <item.read_sections joined by ", ">

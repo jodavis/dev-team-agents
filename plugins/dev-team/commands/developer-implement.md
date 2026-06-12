@@ -16,7 +16,7 @@ $TASK_BRIEF
 
 ## Steps
 
-### 0 — Ensure feature branch
+### 0 — Ensure task branch
 
 Check the current branch:
 
@@ -24,13 +24,13 @@ Check the current branch:
 git branch --show-current
 ```
 
-If the branch name contains `$ARGUMENTS` (the work item ID, e.g. `Issue-123`), the correct
-branch is already active — proceed to Step 1.
+If the branch is `dev/claude/$ARGUMENTS`, proceed to Step 1 — the workspace is already
+set up.
 
-Otherwise, invoke the shared branch-creation skill:
+Otherwise, create and switch to the task branch:
 
 ```bash
-/create-branch $ARGUMENTS "<task brief first sentence>"
+git checkout -b dev/claude/$ARGUMENTS
 ```
 
 Do not push — the pipeline pushes after validation passes.

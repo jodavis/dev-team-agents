@@ -27,7 +27,8 @@ Parse the following fields from your prompt:
 
 - `agent` — sub-agent type to spawn via the `Agent` tool (used for display/logging in
   the context header only; does not affect routing or tool selection)
-- `skill` — name of the skill the sub-agent should invoke
+- `skill` — name of the skill the sub-agent should execute
+- `plugin_root` — absolute path to the dev-team plugin directory (used to load skill files)
 - `context_file` — absolute path to the pipeline context file
 - `args` — (optional) positional arguments to present to the skill
 - `read_sections` — comma-separated list of section names to read from the context file
@@ -40,30 +41,32 @@ Use the `Read` tool to read `context_file`. Extract the content of each section 
 `read_sections`. A section begins at `<!-- section:Name -->` and ends at the next
 `<!-- section:` sentinel or end of file.
 
-### Step 2 — Present context
+### Step 2 — Load and substitute skill content
 
-Present the extracted sections as a quoted block in your conversation before invoking
-the skill. Format:
+Using the `Read` tool, read: `<plugin_root>/commands/<skill>.md`
 
-```
-## Context from pipeline
+Strip the YAML frontmatter — everything from the opening `---` line to the closing `---`
+line (inclusive), plus any blank line immediately after.
 
-### <Section Name>
-<content>
-```
+Apply the following substitutions to the remaining content using the values already
+extracted from the context file:
 
-Also present the `args` value (if provided) as:
-```
-## Arguments
-<args>
-```
+| Variable | Source |
+|----------|--------|
+| `$ARGUMENTS` | `args` field from this prompt |
+| `$TASK_BRIEF` | "Researcher Brief" section content |
+| `$WORK_SUMMARIES` | "Implementation Summary" section + all "Fix N" sections, concatenated with `\n\n---\n\n` |
+| `$ISSUES` | "Last Failure" section content (or "Validate Result" if "Last Failure" is empty) |
+| `$PR_URL` | "PR URL" section content |
+| `$CONTEXT_FILE` | `context_file` path |
 
-Set `$CONTEXT_FILE` to the value of `context_file` — skills that need mid-task reads
-use this substitution.
+Leave any variable with no matching value unchanged.
 
 ### Step 3 — Spawn the sub-agent
 
-Spawn a sub-agent using the `Agent` tool:
+Spawn a sub-agent using the `Agent` tool, passing the substituted skill content directly
+as `## Instructions`. The sub-agent executes the instructions without needing to load any
+skill files.
 
 ```
 Agent(
@@ -77,13 +80,13 @@ Agent(
 ## Arguments
 <args>
 
-## Skill
-<skill>
+## Instructions
+<substituted skill content>
 """
 )
 ```
 
-The sub-agent invokes the named skill and returns its full output. Capture that output
+The sub-agent executes the instructions and returns its full output. Capture that output
 as the skill result for Step 4.
 
 ### Step 4 — Write result to context file (Edit only — never Write)

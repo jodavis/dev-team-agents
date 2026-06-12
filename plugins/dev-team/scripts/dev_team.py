@@ -199,6 +199,7 @@ class PipelineContext:
     build_log: str = ""
     test_log: str = ""
     debug_report: str = ""
+    workspace_setup: str = ""
     signoff_review: str = ""
     signoff_research: str = ""
     signoff_build_result: str = ""
@@ -238,6 +239,9 @@ class PipelineContext:
             "",
             f"# {self.work_item_id} Dev Team Context",
         ]
+
+        if self.workspace_setup:
+            lines += ["", "<!-- section:Workspace Setup -->", "", self.workspace_setup.strip()]
 
         if self.debug_report:
             lines += ["", "<!-- section:Debug Report -->", "", self.debug_report.strip()]
@@ -308,6 +312,7 @@ class PipelineContext:
             pass
 
         sections = _parse_sections(body)
+        ctx.workspace_setup = sections.get("Workspace Setup", "")
         ctx.debug_report = sections.get("Debug Report", "")
         ctx.brief = sections.get("Researcher Brief", "")
 
@@ -500,6 +505,43 @@ class Step(ABC):
     def handle_results(self) -> str:
         """Process results from the context file and return a trigger moniker."""
         ...
+
+
+class SetupWorkspaceStep(Step):
+    handles = "setting-up"
+    _PENDING_KEY = "setup"
+
+    def __init__(self, ctx: "PipelineContext", context_path: Path) -> None:
+        self._ctx = ctx
+        self._context_path = context_path
+
+    def get_actions(self) -> list[dict]:
+        ctx = self._ctx
+        if ctx.workspace_setup:
+            return []
+        return [{
+            "action": "spawn_agent",
+            "message": f"Setting up workspace branch for {ctx.work_item_id}.",
+            "agent": "workspace-setup",
+            "skill": "workspace-setup",
+            "args": f"{ctx.work_item_id} {ctx.spec_path}",
+            "context_file": str(self._context_path),
+            "read_sections": [],
+            "write_section": "Workspace Setup",
+            "result_format": "setup_done | failed",
+        }]
+
+    def handle_results(self) -> str:
+        ctx = self._ctx
+        if ctx.workspace_setup:
+            _handle_agent_success(ctx)
+            return "setup_done"
+        _handle_agent_failure(ctx)
+        _check_and_trigger_troubleshooter(
+            "consecutive_failures", CONSECUTIVE_FAILURES_THRESHOLD,
+            ctx.consecutive_failures, ctx, self._context_path,
+        )
+        return "failed"
 
 
 class FindSpecStep(Step):
@@ -1125,6 +1167,7 @@ class DevTeamPipeline:
         self.machine = StateMachine(workflow.transitions, initial=ctx.state)
         self.step_handlers: dict[str, Step] = {
             "spec-finding": FindSpecStep(ctx),
+            "setting-up": SetupWorkspaceStep(ctx, context_path),
             "debugging": DebugStep(ctx, context_path),
             "researching": ResearchStep(research_skill, ctx, context_path),
             "implementing": ImplementStep(ctx, context_path),
