@@ -77,7 +77,7 @@ constructor gains a new dependency, only `make_sut()` needs to change.
 Use `pytest-asyncio` for async tests. Mark tests with `@pytest.mark.asyncio`.
 
 **Simulating incomplete and faulted coroutines:**
-- Use `asyncio.Future()` to represent a coroutine that stays incomplete until you decide — equivalent to C#'s `TaskCompletionSource`.
+- Use `asyncio.Future()` to represent a coroutine that stays incomplete until you decide.
   - Resolve it later: `future.set_result(value)`
   - Fault it: `future.set_exception(SomeException(...))`
   - Leave it pending to assert the caller stays suspended.
